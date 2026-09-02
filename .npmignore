@@ -1,0 +1,9 @@
+# Source files & typescript configs
+src/
+tsconfig.json
+.gitignore
+
+# Build & Toolchain configs
+*.log
+.vscode/
+node_modules/
