@@ -1,6 +1,6 @@
 {
   "name": "@bdking71/spsignature",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "SharePoint Framework WebPart isolated digital signing and provisioning engine.",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -30,5 +30,13 @@
     "@pnp/sp": "^3.0.0",
     "rimraf": "^5.0.0",
     "typescript": "~5.3.3"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bdking71/spsignature"
+  },
+  "bugs": {
+    "url": "https://github.com/bdking71/spsignature/issues"
+  },
+  "homepage": "https://github.com/bdking71/spsignature#readme"
 }
