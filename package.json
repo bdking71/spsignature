@@ -1,6 +1,6 @@
 {
   "name": "@bdking71/spsignature",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "SharePoint Framework WebPart isolated digital signing and provisioning engine.",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",

@@ -1,6 +1,6 @@
 # @bdking71/spsignature
 
-@bdking71/spsignature provides a secure, lightweight, and framework-agnostic digital signature module engineered specifically for Microsoft 365 environments. Built to run inside custom SPFx Web Parts and Extension Application Customizers, it delivers tamper-evident signature collection, automated base64 image encoding, and structured payload generation directly integrated with SharePoint Online list infrastructure.
+(UNTESTED/Active Development Please do not use at this time.) @bdking71/spsignature provides a secure, lightweight, and framework-agnostic digital signature module engineered specifically for Microsoft 365 environments. Built to run inside custom SPFx Web Parts and Extension Application Customizers, it delivers tamper-evident signature collection, automated base64 image encoding, and structured payload generation directly integrated with SharePoint Online list infrastructure.
 
 Key Capabilities & Business Value
 
