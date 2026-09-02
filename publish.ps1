@@ -27,4 +27,4 @@ Write-Host "==> 4. Publishing to NPM Registry..." -ForegroundColor Cyan
 npm publish --access public
 Write-Host "Successfully published $newVersion to NPM!" -ForegroundColor Green
 
-Write-Host "`nAll operations completed successfully." -ForegroundColor Positive
+Write-Host "`nAll operations completed successfully." -ForegroundColor Green
