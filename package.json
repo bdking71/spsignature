@@ -1,6 +1,6 @@
 {
   "name": "@bdking71/spsignature",
-  "version": "1.3.5",
+  "version": "1.3.6",
   "description": "SharePoint Framework isolated digital signing, LZW compression, and OTP audit engine.",
   "main": "lib/index.js",
   "module": "lib/index.js",
@@ -32,7 +32,8 @@
     "2fa",
     "otp",
     "audit",
-    "m365"
+    "m365",
+    "react"
   ],
   "author": {
     "name": "Bryan King",
@@ -49,11 +50,14 @@
   "homepage": "https://github.com/bdking71/spsignature#readme",
   "peerDependencies": {
     "@microsoft/sp-webpart-base": ">=1.15.0",
-    "@pnp/sp": ">=3.0.0"
+    "@pnp/sp": ">=3.0.0",
+    "react": ">=16.8.0"
   },
   "devDependencies": {
     "@microsoft/sp-webpart-base": "^1.18.0",
     "@pnp/sp": "^3.0.0",
+    "@types/react": "^17.0.0",
+    "react": "^17.0.1",
     "rimraf": "^5.0.0",
     "typescript": "~5.3.3"
   }
