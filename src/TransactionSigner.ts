@@ -1,30 +1,94 @@
-import { WebPartContext } from "@microsoft/sp-webpart-base";
-import { createPendingVerification, DeliveryChannel } from "./VerificationService";
+/**
+ * @file SecureAuditSignature.ts
+ *
+ * Provides a secure, auditable digital-signature workflow for SharePoint
+ * web parts.  The module renders a modal dialog that supports:
+ *
+ *   • Drawing a signature on an HTML canvas
+ *   • Uploading a signature image (PNG / JPG, ≤ 5 MB)
+ *   • Re-using a previously cached (LZW-compressed) signature from
+ *     localStorage
+ *   • Optional two-factor authentication via a 5-digit passcode
+ *     dispatched through email or Microsoft Teams
+ *
+ * After the user signs, the module hashes the audit envelope
+ * (payload + signer + timestamp) with SHA-256 so that the record can
+ * later be verified without exposing the original payload.
+ *
+ * @module SecureAuditSignature
+ */
 
+import { WebPartContext } from "@microsoft/sp-webpart-base";
+import { dispatchOtpPasscode, DeliveryChannel } from "./OtpService";
+
+/** localStorage key used to persist a compressed signature across sessions. */
 const STORAGE_KEY = "secure_audit_cached_signature_v1";
 
+/** Maximum upload file size in bytes (5 MB). */
+const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Public interfaces
+// ---------------------------------------------------------------------------
+
+/**
+ * Describes everything the caller must (or may) supply when requesting a
+ * signed audit record.
+ */
 export interface SignerContext {
+  /** SharePoint list-item ID that the signature relates to. */
   itemID: number;
+  /** Display name or email of the person signing. */
   signer: string;
+  /** Arbitrary key/value data to include in the audit envelope. */
   payload: Record<string, unknown>;
+  /** SPFx web-part context – required for PnPjs / Graph calls. */
   spContext: WebPartContext;
+  /** How to deliver the two-factor passcode (`"email"` | `"teams"`). */
   channel?: DeliveryChannel;
+  /**
+   * Whether two-factor authentication is required.
+   * Defaults to `true` when omitted or set to `undefined`.
+   */
   requireTFA?: boolean;
 }
 
+/**
+ * The record that is ultimately persisted to SharePoint after a
+ * successful signing ceremony.
+ */
 export interface SharePointAuditRecord {
+  /** SHA-256 hex digest of the canonical audit envelope. */
   signatureHash: string;
+  /** LZW-compressed data-URI of the signature image. */
   signatureData: string;
+  /** ISO-8601 timestamp captured at the moment of signing. */
   signatureTimestamp: string;
+  /** ID of the verification list-item (if two-factor was used). */
   verificationItemId: number;
 }
 
+/**
+ * The canonical shape that is hashed to produce `signatureHash`.
+ * The payload keys are sorted alphabetically so that hash
+ * verification is order-independent.
+ */
 export interface AuditEnvelopeRecord {
   payload: Record<string, unknown>;
   signer: string;
   timestamp: string;
 }
 
+// ---------------------------------------------------------------------------
+// Helpers – passcode generation
+// ---------------------------------------------------------------------------
+
+/**
+ * Generates a cryptographically random 5-digit passcode (10 000 – 99 999)
+ * using the Web Crypto API.
+ *
+ * @returns A string representation of the 5-digit code.
+ */
 function generateFiveDigitPasscode(): string {
   const array = new Uint32Array(1);
   window.crypto.getRandomValues(array);
@@ -32,20 +96,59 @@ function generateFiveDigitPasscode(): string {
   return code.toString();
 }
 
+// ---------------------------------------------------------------------------
+// Main public function – modal signing ceremony
+// ---------------------------------------------------------------------------
+
+/**
+ * Opens a full-screen modal dialog that walks the user through:
+ *
+ * 1. (Optional) Two-factor passcode verification
+ * 2. Providing a digital signature (cached / drawn / uploaded)
+ * 3. Generating a tamper-evident SHA-256 audit record
+ *
+ * The returned promise resolves with a `SharePointAuditRecord` on
+ * success or `undefined` if the user cancels.
+ *
+ * @param context        - Signer metadata and SPFx context.
+ * @param modalTitle     - Title shown in the modal header.
+ * @param warningMessage - Instructional HTML rendered above the
+ *                         signature area.
+ * @returns A promise that resolves to the audit record or `undefined`.
+ *
+ * @throws {Error} If `context.spContext` is falsy.
+ *
+ * @example
+ * ```ts
+ * const record = await promptAndGenerateSecureAudit({
+ *   itemID: 42,
+ *   signer: currentUser.email,
+ *   payload: { amount: 1500, vendor: "Contoso" },
+ *   spContext: this.context,
+ *   channel: "email",
+ *   requireTFA: true,
+ * });
+ * ```
+ */
 export async function promptAndGenerateSecureAudit(
   context: SignerContext,
   modalTitle: string = "Approve Purchase Requisition",
   warningMessage: string = "Please review your entry and apply your signature to finalize this record."
 ): Promise<SharePointAuditRecord | undefined> {
   if (!context.spContext) {
-    throw new Error("Execution restricted: Valid WebPartContext must be supplied.");
+    throw new Error(
+      "Execution restricted: Valid WebPartContext must be supplied."
+    );
   }
 
   return new Promise<SharePointAuditRecord | undefined>((resolve): void => {
     const requireTFA = context.requireTFA !== false;
     const generatedPasscode = generateFiveDigitPasscode();
-    let storedVerificationItemId: number = context.itemID;
+    let storedVerificationItemId: number | undefined = undefined;
 
+    // -----------------------------------------------------------------
+    // Overlay
+    // -----------------------------------------------------------------
     const overlay: HTMLDivElement = document.createElement("div");
     overlay.style.position = "fixed";
     overlay.style.top = "0";
@@ -57,9 +160,13 @@ export async function promptAndGenerateSecureAudit(
     overlay.style.display = "flex";
     overlay.style.alignItems = "center";
     overlay.style.justifyContent = "center";
-    overlay.style.fontFamily = "'Segoe UI', Tahoma, Geneva, Verdana, sans-serif";
+    overlay.style.fontFamily =
+      "'Segoe UI', Tahoma, Geneva, Verdana, sans-serif";
     overlay.style.backdropFilter = "blur(3px)";
 
+    // -----------------------------------------------------------------
+    // Modal container
+    // -----------------------------------------------------------------
     const modalBox: HTMLDivElement = document.createElement("div");
     modalBox.style.backgroundColor = "#ffffff";
     modalBox.style.padding = "0";
@@ -72,6 +179,9 @@ export async function promptAndGenerateSecureAudit(
     modalBox.style.display = "flex";
     modalBox.style.flexDirection = "column";
 
+    // -----------------------------------------------------------------
+    // Header
+    // -----------------------------------------------------------------
     const headerSection: HTMLDivElement = document.createElement("div");
     headerSection.style.backgroundColor = "#0078d4";
     headerSection.style.padding = "20px 24px";
@@ -87,6 +197,9 @@ export async function promptAndGenerateSecureAudit(
 
     headerSection.appendChild(title);
 
+    // -----------------------------------------------------------------
+    // Content wrapper
+    // -----------------------------------------------------------------
     const contentSection: HTMLDivElement = document.createElement("div");
     contentSection.style.padding = "24px";
     contentSection.style.backgroundColor = "#fafafa";
@@ -100,6 +213,9 @@ export async function promptAndGenerateSecureAudit(
     body.style.lineHeight = "1.6";
     body.style.margin = "0 0 20px 0";
 
+    // -----------------------------------------------------------------
+    // Sign button (footer)
+    // -----------------------------------------------------------------
     const signButton: HTMLButtonElement = document.createElement("button");
     signButton.innerText = "I Agree and Sign";
     signButton.style.padding = "10px 24px";
@@ -112,16 +228,29 @@ export async function promptAndGenerateSecureAudit(
     signButton.style.borderRadius = "4px";
     signButton.style.transition = "all 0.2s ease";
 
-    const verificationContainer: HTMLDivElement = document.createElement("div");
+    // -----------------------------------------------------------------
+    // Two-factor verification panel
+    // -----------------------------------------------------------------
+    const verificationContainer: HTMLDivElement =
+      document.createElement("div");
+
+    /** Direct reference to the passcode <input> (avoids fragile querySelector). */
+    let verificationInput: HTMLInputElement | null = null;
+    /** Direct reference to the "Resend Code" button. */
+    let sendCodeButton: HTMLButtonElement | null = null;
+
     if (requireTFA) {
       verificationContainer.style.marginBottom = "20px";
       verificationContainer.style.padding = "16px";
       verificationContainer.style.backgroundColor = "#fff8e1";
       verificationContainer.style.border = "1px solid #ffd54f";
       verificationContainer.style.borderRadius = "6px";
-      verificationContainer.style.boxShadow = "0 2px 4px rgba(0,0,0,0.05)";
+      verificationContainer.style.boxShadow =
+        "0 2px 4px rgba(0,0,0,0.05)";
 
-      const verificationHeader: HTMLDivElement = document.createElement("div");
+      /* Header row with lock icon */
+      const verificationHeader: HTMLDivElement =
+        document.createElement("div");
       verificationHeader.style.display = "flex";
       verificationHeader.style.alignItems = "center";
       verificationHeader.style.marginBottom = "12px";
@@ -131,7 +260,8 @@ export async function promptAndGenerateSecureAudit(
       lockIcon.innerHTML = "🔐";
       lockIcon.style.fontSize = "18px";
 
-      const verificationLabel: HTMLLabelElement = document.createElement("label");
+      const verificationLabel: HTMLLabelElement =
+        document.createElement("label");
       verificationLabel.innerText = "Two-Factor Authentication";
       verificationLabel.style.display = "block";
       verificationLabel.style.fontSize = "13px";
@@ -142,18 +272,23 @@ export async function promptAndGenerateSecureAudit(
       verificationHeader.appendChild(lockIcon);
       verificationHeader.appendChild(verificationLabel);
 
-      const verificationDescription: HTMLParagraphElement = document.createElement("p");
-      verificationDescription.innerText = `A 5-digit verification code has been sent to ${context.channel === "teams" ? "Microsoft Teams" : "your email"}.`;
+      const verificationDescription: HTMLParagraphElement =
+        document.createElement("p");
+      verificationDescription.innerText = `A 5-digit verification code has been sent to ${
+        context.channel === "teams" ? "Microsoft Teams" : "your email"
+      }.`;
       verificationDescription.style.fontSize = "12px";
       verificationDescription.style.color = "#605e5c";
       verificationDescription.style.margin = "0 0 12px 0";
       verificationDescription.style.lineHeight = "1.5";
 
-      const verificationRow: HTMLDivElement = document.createElement("div");
+      /* Input + Resend row */
+      const verificationRow: HTMLDivElement =
+        document.createElement("div");
       verificationRow.style.display = "flex";
       verificationRow.style.gap = "10px";
 
-      const verificationInput: HTMLInputElement = document.createElement("input");
+      verificationInput = document.createElement("input");
       verificationInput.type = "text";
       verificationInput.maxLength = 5;
       verificationInput.placeholder = "Enter 5-digit code";
@@ -169,14 +304,15 @@ export async function promptAndGenerateSecureAudit(
       verificationInput.style.letterSpacing = "2px";
       verificationInput.style.fontWeight = "600";
 
-      verificationInput.onfocus = (): void => {
-        verificationInput.style.borderColor = "#0078d4";
+      const vInput = verificationInput; // capture for closures
+      vInput.onfocus = (): void => {
+        vInput.style.borderColor = "#0078d4";
       };
-      verificationInput.onblur = (): void => {
-        verificationInput.style.borderColor = "#d1d1d1";
+      vInput.onblur = (): void => {
+        vInput.style.borderColor = "#d1d1d1";
       };
 
-      const sendCodeButton: HTMLButtonElement = document.createElement("button");
+      sendCodeButton = document.createElement("button");
       sendCodeButton.innerText = "Resend Code";
       sendCodeButton.type = "button";
       sendCodeButton.style.padding = "10px 16px";
@@ -190,14 +326,15 @@ export async function promptAndGenerateSecureAudit(
       sendCodeButton.style.fontWeight = "600";
       sendCodeButton.style.transition = "all 0.2s ease";
 
-      sendCodeButton.onmouseover = (): void => {
-        sendCodeButton.style.backgroundColor = "#0078d4";
-        sendCodeButton.style.color = "#ffffff";
+      const scBtn = sendCodeButton; // capture for closures
+      scBtn.onmouseover = (): void => {
+        scBtn.style.backgroundColor = "#0078d4";
+        scBtn.style.color = "#ffffff";
       };
-      sendCodeButton.onmouseout = (): void => {
-        if (!sendCodeButton.disabled) {
-          sendCodeButton.style.backgroundColor = "#ffffff";
-          sendCodeButton.style.color = "#0078d4";
+      scBtn.onmouseout = (): void => {
+        if (!scBtn.disabled) {
+          scBtn.style.backgroundColor = "#ffffff";
+          scBtn.style.color = "#0078d4";
         }
       };
 
@@ -209,12 +346,21 @@ export async function promptAndGenerateSecureAudit(
       verificationContainer.appendChild(verificationRow);
     }
 
-    const cachedCompressedSig: string | null = localStorage.getItem(STORAGE_KEY);
-    const hasCachedSignature: boolean = cachedCompressedSig !== null && cachedCompressedSig.trim() !== "";
-    const decompressedCachedDataUri: string = (hasCachedSignature && cachedCompressedSig)
-      ? lzwDecompress(cachedCompressedSig)
-      : "";
+    // -----------------------------------------------------------------
+    // Cached-signature detection
+    // -----------------------------------------------------------------
+    const cachedCompressedSig: string | null =
+      localStorage.getItem(STORAGE_KEY);
+    let hasCachedSignature: boolean =
+      cachedCompressedSig !== null && cachedCompressedSig.trim() !== "";
+    const decompressedCachedDataUri: string =
+      hasCachedSignature && cachedCompressedSig
+        ? lzwDecompress(cachedCompressedSig)
+        : "";
 
+    // -----------------------------------------------------------------
+    // Signature section wrapper
+    // -----------------------------------------------------------------
     const signatureSection: HTMLDivElement = document.createElement("div");
     signatureSection.style.marginBottom = "20px";
     signatureSection.style.padding = "16px";
@@ -226,15 +372,18 @@ export async function promptAndGenerateSecureAudit(
     const signatureHeader: HTMLDivElement = document.createElement("div");
     signatureHeader.style.marginBottom = "12px";
 
-    const signatureLabel: HTMLHeadingElement = document.createElement("h3");
+    const signatureLabel: HTMLHeadingElement =
+      document.createElement("h3");
     signatureLabel.innerText = "Digital Signature";
     signatureLabel.style.fontSize = "14px";
     signatureLabel.style.fontWeight = "700";
     signatureLabel.style.color = "#323130";
     signatureLabel.style.margin = "0 0 4px 0";
 
-    const signatureSubtext: HTMLParagraphElement = document.createElement("p");
-    signatureSubtext.innerText = "Choose how you'd like to provide your signature";
+    const signatureSubtext: HTMLParagraphElement =
+      document.createElement("p");
+    signatureSubtext.innerText =
+      "Choose how you'd like to provide your signature";
     signatureSubtext.style.fontSize = "12px";
     signatureSubtext.style.color = "#605e5c";
     signatureSubtext.style.margin = "0";
@@ -242,6 +391,9 @@ export async function promptAndGenerateSecureAudit(
     signatureHeader.appendChild(signatureLabel);
     signatureHeader.appendChild(signatureSubtext);
 
+    // -----------------------------------------------------------------
+    // "Remember signature" checkbox
+    // -----------------------------------------------------------------
     const cacheControlBox: HTMLDivElement = document.createElement("div");
     cacheControlBox.style.marginTop = "16px";
     cacheControlBox.style.padding = "12px";
@@ -250,7 +402,8 @@ export async function promptAndGenerateSecureAudit(
     cacheControlBox.style.borderRadius = "4px";
     cacheControlBox.style.fontSize = "12px";
 
-    const cacheCheckboxLabel: HTMLLabelElement = document.createElement("label");
+    const cacheCheckboxLabel: HTMLLabelElement =
+      document.createElement("label");
     cacheCheckboxLabel.style.display = "flex";
     cacheCheckboxLabel.style.alignItems = "center";
     cacheCheckboxLabel.style.gap = "8px";
@@ -263,8 +416,10 @@ export async function promptAndGenerateSecureAudit(
     cacheCheckbox.style.width = "16px";
     cacheCheckbox.style.height = "16px";
 
-    const cacheCheckboxText: HTMLSpanElement = document.createElement("span");
-    cacheCheckboxText.innerText = "Remember my signature on this device for future transactions";
+    const cacheCheckboxText: HTMLSpanElement =
+      document.createElement("span");
+    cacheCheckboxText.innerText =
+      "Remember my signature on this device for future transactions";
     cacheCheckboxText.style.color = "#323130";
     cacheCheckboxText.style.fontSize = "12px";
 
@@ -272,13 +427,19 @@ export async function promptAndGenerateSecureAudit(
     cacheCheckboxLabel.appendChild(cacheCheckboxText);
     cacheControlBox.appendChild(cacheCheckboxLabel);
 
-    const cachedNoticeContainer: HTMLDivElement = document.createElement("div");
+    // -----------------------------------------------------------------
+    // Cached-signature notice panel
+    // -----------------------------------------------------------------
+    const cachedNoticeContainer: HTMLDivElement =
+      document.createElement("div");
     cachedNoticeContainer.style.marginBottom = "16px";
     cachedNoticeContainer.style.padding = "16px";
     cachedNoticeContainer.style.backgroundColor = "#e6f4ff";
     cachedNoticeContainer.style.border = "1px solid #0078d4";
     cachedNoticeContainer.style.borderRadius = "6px";
-    cachedNoticeContainer.style.display = hasCachedSignature ? "block" : "none";
+    cachedNoticeContainer.style.display = hasCachedSignature
+      ? "block"
+      : "none";
 
     const cachedNoticeText: HTMLDivElement = document.createElement("div");
     cachedNoticeText.innerText = "✓ Saved signature on file";
@@ -287,7 +448,8 @@ export async function promptAndGenerateSecureAudit(
     cachedNoticeText.style.fontWeight = "600";
     cachedNoticeText.style.color = "#0078d4";
 
-    const cachedPreviewImage: HTMLImageElement = document.createElement("img");
+    const cachedPreviewImage: HTMLImageElement =
+      document.createElement("img");
     cachedPreviewImage.src = decompressedCachedDataUri;
     cachedPreviewImage.style.maxWidth = "100%";
     cachedPreviewImage.style.height = "auto";
@@ -301,7 +463,8 @@ export async function promptAndGenerateSecureAudit(
     cachedPreviewImage.style.padding = "8px";
     cachedPreviewImage.style.objectFit = "contain";
 
-    const removeCachedBtn: HTMLButtonElement = document.createElement("button");
+    const removeCachedBtn: HTMLButtonElement =
+      document.createElement("button");
     removeCachedBtn.innerText = "Remove Saved Signature";
     removeCachedBtn.style.padding = "6px 12px";
     removeCachedBtn.style.fontSize = "11px";
@@ -326,13 +489,26 @@ export async function promptAndGenerateSecureAudit(
     cachedNoticeContainer.appendChild(cachedPreviewImage);
     cachedNoticeContainer.appendChild(removeCachedBtn);
 
+    // -----------------------------------------------------------------
+    // Tab bar (Saved / Draw New / Upload Image)
+    // -----------------------------------------------------------------
     const modeContainer: HTMLDivElement = document.createElement("div");
     modeContainer.style.display = "flex";
     modeContainer.style.gap = "8px";
     modeContainer.style.marginBottom = "16px";
     modeContainer.style.borderBottom = "2px solid #edebe9";
 
-    const createTab = (text: string, isActive: boolean): HTMLButtonElement => {
+    /**
+     * Factory that creates a styled tab button.
+     *
+     * @param text      - Label for the tab.
+     * @param isActive  - Whether the tab should appear selected initially.
+     * @returns The constructed `<button>` element.
+     */
+    const createTab = (
+      text: string,
+      isActive: boolean
+    ): HTMLButtonElement => {
       const tab = document.createElement("button");
       tab.innerText = text;
       tab.style.padding = "10px 16px";
@@ -342,17 +518,29 @@ export async function promptAndGenerateSecureAudit(
       tab.style.backgroundColor = "transparent";
       tab.style.color = isActive ? "#0078d4" : "#605e5c";
       tab.style.border = "none";
-      tab.style.borderBottom = isActive ? "3px solid #0078d4" : "3px solid transparent";
+      tab.style.borderBottom = isActive
+        ? "3px solid #0078d4"
+        : "3px solid transparent";
       tab.style.transition = "all 0.2s ease";
       tab.style.outline = "none";
 
+      /* Hover handlers check current activeMode so they remain correct
+         after the user switches tabs. */
       tab.onmouseover = (): void => {
-        if (!isActive) {
+        const tabIsCurrentlyActive =
+          (tab === cachedTabBtn && activeMode === "cached") ||
+          (tab === drawTabBtn && activeMode === "draw") ||
+          (tab === uploadTabBtn && activeMode === "upload");
+        if (!tabIsCurrentlyActive) {
           tab.style.color = "#0078d4";
         }
       };
       tab.onmouseout = (): void => {
-        if (!isActive) {
+        const tabIsCurrentlyActive =
+          (tab === cachedTabBtn && activeMode === "cached") ||
+          (tab === drawTabBtn && activeMode === "draw") ||
+          (tab === uploadTabBtn && activeMode === "upload");
+        if (!tabIsCurrentlyActive) {
           tab.style.color = "#605e5c";
         }
       };
@@ -361,7 +549,9 @@ export async function promptAndGenerateSecureAudit(
     };
 
     const cachedTabBtn = createTab("Saved", hasCachedSignature);
-    cachedTabBtn.style.display = hasCachedSignature ? "inline-block" : "none";
+    cachedTabBtn.style.display = hasCachedSignature
+      ? "inline-block"
+      : "none";
 
     const drawTabBtn = createTab("Draw New", !hasCachedSignature);
     const uploadTabBtn = createTab("Upload Image", false);
@@ -372,10 +562,16 @@ export async function promptAndGenerateSecureAudit(
     modeContainer.appendChild(drawTabBtn);
     modeContainer.appendChild(uploadTabBtn);
 
+    // -----------------------------------------------------------------
+    // Cached panel
+    // -----------------------------------------------------------------
     const cachedPanel: HTMLDivElement = document.createElement("div");
     cachedPanel.style.display = hasCachedSignature ? "block" : "none";
     cachedPanel.appendChild(cachedNoticeContainer);
 
+    // -----------------------------------------------------------------
+    // Draw panel (canvas)
+    // -----------------------------------------------------------------
     const drawPanel: HTMLDivElement = document.createElement("div");
     drawPanel.style.display = hasCachedSignature ? "none" : "block";
 
@@ -385,7 +581,8 @@ export async function promptAndGenerateSecureAudit(
     canvasContainer.style.borderRadius = "6px";
     canvasContainer.style.border = "2px dashed #d1d1d1";
 
-    const canvasInstructions: HTMLParagraphElement = document.createElement("p");
+    const canvasInstructions: HTMLParagraphElement =
+      document.createElement("p");
     canvasInstructions.innerText = "Draw your signature below:";
     canvasInstructions.style.fontSize = "12px";
     canvasInstructions.style.color = "#605e5c";
@@ -403,6 +600,7 @@ export async function promptAndGenerateSecureAudit(
     canvas.style.borderRadius = "4px";
     canvas.style.boxShadow = "inset 0 1px 3px rgba(0,0,0,0.1)";
 
+    /** Button to clear the drawing canvas. */
     const clearButton: HTMLButtonElement = document.createElement("button");
     clearButton.innerText = "Clear Canvas";
     clearButton.style.marginTop = "10px";
@@ -428,6 +626,9 @@ export async function promptAndGenerateSecureAudit(
     canvasContainer.appendChild(clearButton);
     drawPanel.appendChild(canvasContainer);
 
+    // -----------------------------------------------------------------
+    // Upload panel
+    // -----------------------------------------------------------------
     const uploadPanel: HTMLDivElement = document.createElement("div");
     uploadPanel.style.display = "none";
     uploadPanel.style.padding = "32px 24px";
@@ -437,7 +638,6 @@ export async function promptAndGenerateSecureAudit(
     uploadPanel.style.borderRadius = "6px";
     uploadPanel.style.transition = "all 0.2s ease";
     uploadPanel.style.minHeight = "200px";
-    uploadPanel.style.display = "none";
     uploadPanel.style.flexDirection = "column";
     uploadPanel.style.alignItems = "center";
     uploadPanel.style.justifyContent = "center";
@@ -454,7 +654,8 @@ export async function promptAndGenerateSecureAudit(
     uploadText.style.margin = "0 0 8px 0";
     uploadText.style.fontWeight = "600";
 
-    const uploadSubtext: HTMLParagraphElement = document.createElement("p");
+    const uploadSubtext: HTMLParagraphElement =
+      document.createElement("p");
     uploadSubtext.innerText = "PNG, JPG (max 5MB)";
     uploadSubtext.style.fontSize = "12px";
     uploadSubtext.style.color = "#8a8886";
@@ -485,7 +686,12 @@ export async function promptAndGenerateSecureAudit(
     uploadPanel.appendChild(fileInput);
     uploadPanel.appendChild(uploadPreview);
 
-    let activeMode: "cached" | "draw" | "upload" = hasCachedSignature ? "cached" : "draw";
+    // -----------------------------------------------------------------
+    // State
+    // -----------------------------------------------------------------
+    let activeMode: "cached" | "draw" | "upload" = hasCachedSignature
+      ? "cached"
+      : "draw";
     let compressedUploadBase64: string = "";
 
     const ctx: CanvasRenderingContext2D | null = canvas.getContext("2d");
@@ -501,20 +707,32 @@ export async function promptAndGenerateSecureAudit(
       ctx.lineJoin = "round";
     }
 
+    // -----------------------------------------------------------------
+    // Button-state helper
+    // -----------------------------------------------------------------
+
+    /**
+     * Re-evaluates whether the "I Agree and Sign" button should be
+     * enabled, based on the current TFA code entry and selected
+     * signature mode.
+     */
     const updateButtonState = (): void => {
       let isCodeValid = true;
 
-      if (requireTFA) {
-        const verificationInput = verificationContainer.querySelector("input") as HTMLInputElement;
+      if (requireTFA && verificationInput) {
         const codeValue = verificationInput.value.trim();
-        isCodeValid = codeValue.length === 5 && codeValue === generatedPasscode;
+        isCodeValid =
+          codeValue.length === 5 && codeValue === generatedPasscode;
       }
 
       let isSignatureValid = false;
       if (activeMode === "cached") {
         isSignatureValid = hasCachedSignature;
       } else if (activeMode === "draw") {
-        isSignatureValid = hasDrawnContent && ctx !== null && !isCanvasEmpty(ctx, canvas.width, canvas.height);
+        isSignatureValid =
+          hasDrawnContent &&
+          ctx !== null &&
+          !isCanvasEmpty(ctx, canvas.width, canvas.height);
       } else {
         isSignatureValid = compressedUploadBase64.trim() !== "";
       }
@@ -532,7 +750,19 @@ export async function promptAndGenerateSecureAudit(
       }
     };
 
-    const setActiveTab = (mode: "cached" | "draw" | "upload"): void => {
+    // -----------------------------------------------------------------
+    // Tab-switching logic
+    // -----------------------------------------------------------------
+
+    /**
+     * Activates the given tab, hiding the other panels and updating
+     * visual tab styles.
+     *
+     * @param mode - Which panel to show.
+     */
+    const setActiveTab = (
+      mode: "cached" | "draw" | "upload"
+    ): void => {
       activeMode = mode;
       cachedPanel.style.display = mode === "cached" ? "block" : "none";
       drawPanel.style.display = mode === "draw" ? "block" : "none";
@@ -543,7 +773,12 @@ export async function promptAndGenerateSecureAudit(
         btn.style.borderBottom = "3px solid transparent";
       });
 
-      const activeBtn = mode === "cached" ? cachedTabBtn : mode === "draw" ? drawTabBtn : uploadTabBtn;
+      const activeBtn =
+        mode === "cached"
+          ? cachedTabBtn
+          : mode === "draw"
+          ? drawTabBtn
+          : uploadTabBtn;
       activeBtn.style.color = "#0078d4";
       activeBtn.style.borderBottom = "3px solid #0078d4";
 
@@ -556,25 +791,34 @@ export async function promptAndGenerateSecureAudit(
     drawTabBtn.onclick = (): void => setActiveTab("draw");
     uploadTabBtn.onclick = (): void => setActiveTab("upload");
 
+    /** Removes the cached signature and switches to the draw tab. */
     removeCachedBtn.onclick = (): void => {
       localStorage.removeItem(STORAGE_KEY);
+      hasCachedSignature = false;
       cachedTabBtn.style.display = "none";
       setActiveTab("draw");
     };
 
-    if (requireTFA && context.channel) {
-      const sendCodeButton = verificationContainer.querySelector("button") as HTMLButtonElement;
-      const verificationInput = verificationContainer.querySelector("input") as HTMLInputElement;
-
+    // -----------------------------------------------------------------
+    // Two-factor: send-code logic
+    // -----------------------------------------------------------------
+    if (requireTFA && context.channel && sendCodeButton && verificationInput) {
       let cooldownTimer: number | null = null;
+      const scBtnRef = sendCodeButton;
+      const vInputRef = verificationInput;
+
+      /**
+       * Starts a 60-second cooldown on the "Resend Code" button to
+       * prevent rapid re-sends.
+       */
       const startCooldownTimer = (): void => {
         let secondsLeft = 60;
-        sendCodeButton.disabled = true;
-        sendCodeButton.style.backgroundColor = "#f3f2f1";
-        sendCodeButton.style.color = "#a19f9d";
-        sendCodeButton.style.borderColor = "#d1d1d1";
-        sendCodeButton.style.cursor = "not-allowed";
-        sendCodeButton.innerText = `Resend (${secondsLeft}s)`;
+        scBtnRef.disabled = true;
+        scBtnRef.style.backgroundColor = "#f3f2f1";
+        scBtnRef.style.color = "#a19f9d";
+        scBtnRef.style.borderColor = "#d1d1d1";
+        scBtnRef.style.cursor = "not-allowed";
+        scBtnRef.innerText = `Resend (${secondsLeft}s)`;
 
         if (cooldownTimer) {
           clearInterval(cooldownTimer);
@@ -583,28 +827,32 @@ export async function promptAndGenerateSecureAudit(
         cooldownTimer = window.setInterval(() => {
           secondsLeft -= 1;
           if (secondsLeft > 0) {
-            sendCodeButton.innerText = `Resend (${secondsLeft}s)`;
+            scBtnRef.innerText = `Resend (${secondsLeft}s)`;
           } else {
             if (cooldownTimer) {
               clearInterval(cooldownTimer);
             }
-            sendCodeButton.disabled = false;
-            sendCodeButton.style.backgroundColor = "#ffffff";
-            sendCodeButton.style.color = "#0078d4";
-            sendCodeButton.style.borderColor = "#0078d4";
-            sendCodeButton.style.cursor = "pointer";
-            sendCodeButton.innerText = "Resend Code";
+            scBtnRef.disabled = false;
+            scBtnRef.style.backgroundColor = "#ffffff";
+            scBtnRef.style.color = "#0078d4";
+            scBtnRef.style.borderColor = "#0078d4";
+            scBtnRef.style.cursor = "pointer";
+            scBtnRef.innerText = "Resend Code";
           }
         }, 1000);
       };
 
+      /**
+       * Dispatches the verification passcode through the configured
+       * channel (email / Teams) and starts the cooldown timer.
+       */
       const triggerSendCode = async (): Promise<void> => {
-        sendCodeButton.innerText = "Sending...";
-        sendCodeButton.disabled = true;
+        scBtnRef.innerText = "Sending...";
+        scBtnRef.disabled = true;
 
         try {
           if (context.spContext && context.channel) {
-            const vResult = await createPendingVerification(
+            const vResult = await dispatchOtpPasscode(
               context.spContext,
               {
                 title: context.signer,
@@ -616,38 +864,72 @@ export async function promptAndGenerateSecureAudit(
             if (vResult.success && vResult.itemId) {
               storedVerificationItemId = vResult.itemId;
             } else {
-              alert("Failed to dispatch verification code. Please try again.");
+              alert(
+                "Failed to dispatch verification code. Please try again."
+              );
             }
           }
         } catch (err) {
           console.error("Failed to send code:", err);
-          alert("Failed to send verification code. Please try again.");
+          alert(
+            "Failed to send verification code. Please try again."
+          );
         } finally {
           startCooldownTimer();
         }
       };
 
-      sendCodeButton.onclick = async (): Promise<void> => {
+      scBtnRef.onclick = async (): Promise<void> => {
         await triggerSendCode();
       };
 
-      verificationInput.oninput = (): void => {
+      vInputRef.oninput = (): void => {
         updateButtonState();
       };
 
       void triggerSendCode();
     }
 
-    const getPos = (e: MouseEvent | TouchEvent): { x: number; y: number } => {
+    // -----------------------------------------------------------------
+    // Canvas drawing helpers
+    // -----------------------------------------------------------------
+
+    /**
+     * Translates a mouse or touch event into canvas-relative
+     * coordinates, accounting for CSS scaling.
+     *
+     * @param e - The originating mouse or touch event.
+     * @returns `{ x, y }` in canvas-pixel space.
+     */
+    const getPos = (
+      e: MouseEvent | TouchEvent
+    ): { x: number; y: number } => {
       const rect: DOMRect = canvas.getBoundingClientRect();
-      const clientX = "touches" in e ? e.touches[0].clientX : (e as MouseEvent).clientX;
-      const clientY = "touches" in e ? e.touches[0].clientY : (e as MouseEvent).clientY;
+      let clientX: number;
+      let clientY: number;
+
+      if ("touches" in e && e.touches.length > 0) {
+        clientX = e.touches[0].clientX;
+        clientY = e.touches[0].clientY;
+      } else if ("changedTouches" in e && e.changedTouches.length > 0) {
+        clientX = e.changedTouches[0].clientX;
+        clientY = e.changedTouches[0].clientY;
+      } else {
+        clientX = (e as MouseEvent).clientX;
+        clientY = (e as MouseEvent).clientY;
+      }
+
       return {
         x: (clientX - rect.left) * (canvas.width / rect.width),
-        y: (clientY - rect.top) * (canvas.height / rect.height)
+        y: (clientY - rect.top) * (canvas.height / rect.height),
       };
     };
 
+    /**
+     * Begins a new drawing stroke at the pointer position.
+     *
+     * @param e - The initiating mouse/touch event.
+     */
     const startDraw = (e: MouseEvent | TouchEvent): void => {
       isDrawing = true;
       hasDrawnContent = true;
@@ -657,6 +939,11 @@ export async function promptAndGenerateSecureAudit(
       e.preventDefault();
     };
 
+    /**
+     * Extends the current stroke to the pointer's new position.
+     *
+     * @param e - The move event.
+     */
     const drawLine = (e: MouseEvent | TouchEvent): void => {
       if (!isDrawing || !ctx) return;
       const pos = getPos(e);
@@ -666,6 +953,7 @@ export async function promptAndGenerateSecureAudit(
       e.preventDefault();
     };
 
+    /** Ends the current drawing stroke. */
     const stopDraw = (): void => {
       isDrawing = false;
       updateButtonState();
@@ -674,10 +962,11 @@ export async function promptAndGenerateSecureAudit(
     canvas.addEventListener("mousedown", startDraw);
     canvas.addEventListener("mousemove", drawLine);
     window.addEventListener("mouseup", stopDraw);
-    canvas.addEventListener("touchstart", startDraw);
-    canvas.addEventListener("touchmove", drawLine);
+    canvas.addEventListener("touchstart", startDraw, { passive: false });
+    canvas.addEventListener("touchmove", drawLine, { passive: false });
     window.addEventListener("touchend", stopDraw);
 
+    /** Clears the drawing canvas back to a blank white rectangle. */
     clearButton.onclick = (): void => {
       if (ctx) {
         ctx.fillStyle = "#ffffff";
@@ -687,10 +976,30 @@ export async function promptAndGenerateSecureAudit(
       }
     };
 
+    // -----------------------------------------------------------------
+    // File upload handler
+    // -----------------------------------------------------------------
+
+    /**
+     * Handles image file selection: validates size, resizes if needed,
+     * and stores the result as a data-URI.
+     */
     fileInput.onchange = (e: Event): void => {
       const target = e.target as HTMLInputElement;
       if (target.files && target.files[0]) {
         const file = target.files[0];
+
+        /* Enforce the advertised 5 MB limit. */
+        if (file.size > MAX_UPLOAD_BYTES) {
+          alert(
+            `File size exceeds 5 MB (${(file.size / 1024 / 1024).toFixed(
+              1
+            )} MB). Please choose a smaller image.`
+          );
+          target.value = "";
+          return;
+        }
+
         const reader = new FileReader();
         reader.onload = (uploadEvent): void => {
           if (uploadEvent.target?.result) {
@@ -718,7 +1027,8 @@ export async function promptAndGenerateSecureAudit(
                 tCtx.fillStyle = "#ffffff";
                 tCtx.fillRect(0, 0, w, h);
                 tCtx.drawImage(img, 0, 0, w, h);
-                compressedUploadBase64 = tempCanvas.toDataURL("image/png");
+                compressedUploadBase64 =
+                  tempCanvas.toDataURL("image/png");
                 uploadPreview.src = compressedUploadBase64;
                 uploadPreview.style.display = "block";
                 updateButtonState();
@@ -731,6 +1041,9 @@ export async function promptAndGenerateSecureAudit(
       }
     };
 
+    // -----------------------------------------------------------------
+    // Footer (Cancel + Sign buttons)
+    // -----------------------------------------------------------------
     const footerSection: HTMLDivElement = document.createElement("div");
     footerSection.style.padding = "20px 24px";
     footerSection.style.backgroundColor = "#ffffff";
@@ -739,7 +1052,8 @@ export async function promptAndGenerateSecureAudit(
     footerSection.style.justifyContent = "flex-end";
     footerSection.style.gap = "12px";
 
-    const cancelButton: HTMLButtonElement = document.createElement("button");
+    const cancelButton: HTMLButtonElement =
+      document.createElement("button");
     cancelButton.innerText = "Cancel";
     cancelButton.style.padding = "10px 24px";
     cancelButton.style.backgroundColor = "#ffffff";
@@ -769,22 +1083,43 @@ export async function promptAndGenerateSecureAudit(
       }
     };
 
+    // -----------------------------------------------------------------
+    // Cleanup helper
+    // -----------------------------------------------------------------
+
+    /**
+     * Removes the modal overlay from the DOM and unregisters window-
+     * level event listeners to prevent memory leaks.
+     */
     const cleanup = (): void => {
+      window.removeEventListener("mouseup", stopDraw);
+      window.removeEventListener("touchend", stopDraw);
       document.body.removeChild(overlay);
     };
 
+    /** Cancel button dismisses the dialog and resolves with `undefined`. */
     cancelButton.onclick = (): void => {
       cleanup();
       resolve(undefined);
     };
 
+    // -----------------------------------------------------------------
+    // Sign button handler
+    // -----------------------------------------------------------------
+
+    /**
+     * Validates the TFA code (if required), extracts the signature
+     * data from the active panel, compresses it, optionally caches it,
+     * then generates the SHA-256 audit record.
+     */
     signButton.onclick = async (): Promise<void> => {
-      if (requireTFA) {
-        const verificationInput = verificationContainer.querySelector("input") as HTMLInputElement;
+      if (requireTFA && verificationInput) {
         const enteredCode = verificationInput.value.trim();
 
         if (enteredCode !== generatedPasscode) {
-          alert("Invalid verification code. Please enter the correct 5-digit code.");
+          alert(
+            "Invalid verification code. Please enter the correct 5-digit code."
+          );
           return;
         }
       }
@@ -793,19 +1128,29 @@ export async function promptAndGenerateSecureAudit(
 
       if (activeMode === "cached") {
         if (!cachedCompressedSig) {
-          alert("No cached signature found. Please select another option.");
+          alert(
+            "No cached signature found. Please select another option."
+          );
           return;
         }
         finalDataUrl = lzwDecompress(cachedCompressedSig);
       } else if (activeMode === "draw") {
-        if (!ctx || isCanvasEmpty(ctx, canvas.width, canvas.height)) {
+        if (
+          !ctx ||
+          isCanvasEmpty(ctx, canvas.width, canvas.height)
+        ) {
           alert("Please draw your signature before proceeding.");
           return;
         }
         finalDataUrl = downscaleCanvas(canvas, 560, 160);
       } else {
-        if (!compressedUploadBase64 || compressedUploadBase64.trim() === "") {
-          alert("Please upload a signature image before proceeding.");
+        if (
+          !compressedUploadBase64 ||
+          compressedUploadBase64.trim() === ""
+        ) {
+          alert(
+            "Please upload a signature image before proceeding."
+          );
           return;
         }
         finalDataUrl = compressedUploadBase64;
@@ -830,7 +1175,7 @@ export async function promptAndGenerateSecureAudit(
         const result: SharePointAuditRecord =
           await generateSecureAuditRecordInternal(fullContext);
 
-        if (storedVerificationItemId) {
+        if (storedVerificationItemId !== undefined) {
           result.verificationItemId = storedVerificationItemId;
         }
 
@@ -843,6 +1188,9 @@ export async function promptAndGenerateSecureAudit(
 
     updateButtonState();
 
+    // -----------------------------------------------------------------
+    // Assemble DOM tree
+    // -----------------------------------------------------------------
     footerSection.appendChild(cancelButton);
     footerSection.appendChild(signButton);
 
@@ -868,7 +1216,24 @@ export async function promptAndGenerateSecureAudit(
   });
 }
 
-export function getReportableSignature(compressedSignatureData: string): string {
+// ---------------------------------------------------------------------------
+// Signature decompression for reports
+// ---------------------------------------------------------------------------
+
+/**
+ * Decompresses an LZW-compressed signature string back into its
+ * original `data:image/…` data-URI for display in reports or
+ * print views.
+ *
+ * @param compressedSignatureData - The LZW-compressed string stored
+ *                                  in SharePoint.
+ * @returns The original data-URI, or an empty string if
+ *          decompression fails or the result is not an image
+ *          data-URI.
+ */
+export function getReportableSignature(
+  compressedSignatureData: string
+): string {
   const decompressed = lzwDecompress(compressedSignatureData);
   if (!decompressed || !decompressed.startsWith("data:image")) {
     return "";
@@ -876,6 +1241,23 @@ export function getReportableSignature(compressedSignatureData: string): string 
   return decompressed;
 }
 
+// ---------------------------------------------------------------------------
+// LZW compression / decompression
+// ---------------------------------------------------------------------------
+
+/**
+ * Compresses a string using the LZW (Lempel-Ziv-Welch) algorithm.
+ *
+ * **Caveat:** When the dictionary grows past 65 535 entries,
+ * `String.fromCharCode` will produce values that may not survive
+ * a round-trip through `localStorage` or JSON.  For very large
+ * inputs consider chunking or switching to a Uint16Array-backed
+ * encoding.
+ *
+ * @param input - The raw string to compress.
+ * @returns The compressed string (each character encodes one
+ *          dictionary index).
+ */
 function lzwCompress(input: string): string {
   const dictionary: { [key: string]: number } = {};
   let c = "";
@@ -904,9 +1286,18 @@ function lzwCompress(input: string): string {
     result.push(dictionary[w]);
   }
 
-  return result.map((n: number): string => String.fromCharCode(n)).join("");
+  return result
+    .map((n: number): string => String.fromCharCode(n))
+    .join("");
 }
 
+/**
+ * Decompresses a string that was compressed with {@link lzwCompress}.
+ *
+ * @param compressed - The LZW-compressed string.
+ * @returns The original string, or an empty string if the input is
+ *          empty or contains an unrecognised dictionary reference.
+ */
 function lzwDecompress(compressed: string): string {
   const dictionary: { [key: number]: string } = {};
   const result: string[] = [];
@@ -924,11 +1315,14 @@ function lzwDecompress(compressed: string): string {
   let entry = "";
   for (let i = 1; i < compressed.length; i += 1) {
     const k = compressed.charCodeAt(i);
-    if (dictionary[k]) {
+    if (dictionary[k] !== undefined) {
       entry = dictionary[k];
     } else if (k === dictionarySize) {
       entry = w + w.charAt(0);
     } else {
+      console.warn(
+        `lzwDecompress: unrecognised dictionary index ${k} at position ${i}.`
+      );
       return "";
     }
 
@@ -940,7 +1334,24 @@ function lzwDecompress(compressed: string): string {
   return result.join("");
 }
 
-function downscaleCanvas(sourceCanvas: HTMLCanvasElement, targetWidth: number, targetHeight: number): string {
+// ---------------------------------------------------------------------------
+// Canvas utilities
+// ---------------------------------------------------------------------------
+
+/**
+ * Draws the contents of `sourceCanvas` onto a new canvas at the
+ * specified dimensions and returns the result as a PNG data-URI.
+ *
+ * @param sourceCanvas - The canvas element to read from.
+ * @param targetWidth  - Desired output width in pixels.
+ * @param targetHeight - Desired output height in pixels.
+ * @returns A `data:image/png;base64,…` string.
+ */
+function downscaleCanvas(
+  sourceCanvas: HTMLCanvasElement,
+  targetWidth: number,
+  targetHeight: number
+): string {
   const tempCanvas = document.createElement("canvas");
   tempCanvas.width = targetWidth;
   tempCanvas.height = targetHeight;
@@ -953,7 +1364,21 @@ function downscaleCanvas(sourceCanvas: HTMLCanvasElement, targetWidth: number, t
   return tempCanvas.toDataURL("image/png");
 }
 
-function isCanvasEmpty(ctx: CanvasRenderingContext2D, width: number, height: number): boolean {
+/**
+ * Determines whether every pixel on the canvas is pure white
+ * (`rgb(255, 255, 255)`), which indicates that the user has not
+ * drawn anything yet.
+ *
+ * @param ctx    - The 2D rendering context of the canvas.
+ * @param width  - Canvas width in pixels.
+ * @param height - Canvas height in pixels.
+ * @returns `true` if the canvas contains only white pixels.
+ */
+function isCanvasEmpty(
+  ctx: CanvasRenderingContext2D,
+  width: number,
+  height: number
+): boolean {
   const pixelBuffer = ctx.getImageData(0, 0, width, height).data;
   for (let i = 0; i < pixelBuffer.length; i += 4) {
     if (
@@ -967,11 +1392,36 @@ function isCanvasEmpty(ctx: CanvasRenderingContext2D, width: number, height: num
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Audit-record verification
+// ---------------------------------------------------------------------------
+
+/**
+ * Re-computes the SHA-256 hash of the audit envelope constructed from
+ * the supplied parameters and compares it to `storedHash`.
+ *
+ * This allows any consumer to independently verify that a signed
+ * record has not been tampered with, without needing access to the
+ * original signature image.
+ *
+ * **Note:** Only top-level payload keys are sorted.  If your payload
+ * contains nested objects whose key order may vary, consider using a
+ * deep-sort utility before calling this function.
+ *
+ * @param payloadToVerify         - The payload that was originally signed.
+ * @param signer                  - The signer identifier used at sign time.
+ * @param timestamp               - The ISO-8601 timestamp captured at sign
+ *                                  time.
+ * @param _compressedSignatureData - The compressed signature (unused by the
+ *                                  hash, retained for API symmetry).
+ * @param storedHash              - The SHA-256 hex digest to compare against.
+ * @returns `true` if the recomputed hash matches `storedHash`.
+ */
 export async function verifySecureAuditRecord(
   payloadToVerify: Record<string, unknown>,
   signer: string,
   timestamp: string,
-  compressedSignatureData: string,
+  _compressedSignatureData: string,
   storedHash: string
 ): Promise<boolean> {
   try {
@@ -992,9 +1442,10 @@ export async function verifySecureAuditRecord(
     const encoder: TextEncoder = new TextEncoder();
     const encodedBytes: Uint8Array = encoder.encode(auditEnvelopeJson);
 
+    // Fixed BufferSource type incompatibility:
     const hashBuffer: ArrayBuffer = await window.crypto.subtle.digest(
       "SHA-256",
-      encodedBytes as unknown as BufferSource
+      encodedBytes.buffer as ArrayBuffer
     );
     const hashArray: number[] = Array.from(new Uint8Array(hashBuffer));
     const recomputedHash: string = hashArray
@@ -1002,35 +1453,70 @@ export async function verifySecureAuditRecord(
       .join("");
 
     return recomputedHash === storedHash.trim();
-
   } catch {
     return false;
   }
 }
 
-async function generateSecureAuditRecordInternal(context: SignerContext & { signatureData: string }): Promise<SharePointAuditRecord> {
+// ---------------------------------------------------------------------------
+// Internal – audit-record generation
+// ---------------------------------------------------------------------------
+
+/**
+ * Constructs the canonical audit envelope from the signer context,
+ * hashes it with SHA-256, and returns a `SharePointAuditRecord`
+ * ready for persistence.
+ *
+ * This is an internal function and is not exported.
+ *
+ * @param context - The full signer context, extended with the
+ *                  compressed signature data string.
+ * @returns A fully populated `SharePointAuditRecord`.
+ *
+ * @throws {Error} If the payload is empty or the signer is blank.
+ */
+async function generateSecureAuditRecordInternal(
+  context: SignerContext & { signatureData: string }
+): Promise<SharePointAuditRecord> {
   const { payload, signer, signatureData } = context;
-  if (!payload || Object.keys(payload).length === 0) throw new Error("Payload cannot be empty.");
-  if (!signer || signer.trim() === "") throw new Error("Signer identifier is required for sealing.");
+
+  if (!payload || Object.keys(payload).length === 0) {
+    throw new Error("Payload cannot be empty.");
+  }
+  if (!signer || signer.trim() === "") {
+    throw new Error("Signer identifier is required for sealing.");
+  }
 
   const signatureTimestamp: string = new Date().toISOString();
-  const sortedPayloadString: string = JSON.stringify(payload, Object.keys(payload).sort());
+  const sortedPayloadString: string = JSON.stringify(
+    payload,
+    Object.keys(payload).sort()
+  );
+
   const auditEnvelope: AuditEnvelopeRecord = {
     payload: JSON.parse(sortedPayloadString) as Record<string, unknown>,
     signer: signer.toLowerCase().trim(),
-    timestamp: signatureTimestamp.trim()
+    timestamp: signatureTimestamp.trim(),
   };
+
   const auditEnvelopeJson: string = JSON.stringify(auditEnvelope);
   const encoder: TextEncoder = new TextEncoder();
   const encodedBytes: Uint8Array = encoder.encode(auditEnvelopeJson);
-  const hashBuffer: ArrayBuffer = await window.crypto.subtle.digest("SHA-256", encodedBytes as unknown as BufferSource);
+
+  // Passing `encodedBytes.buffer as ArrayBuffer` satisfies the DOM BufferSource definition
+  const hashBuffer: ArrayBuffer = await window.crypto.subtle.digest(
+    "SHA-256",
+    encodedBytes.buffer as ArrayBuffer
+  );
   const hashArray: number[] = Array.from(new Uint8Array(hashBuffer));
-  const signatureHash: string = hashArray.map((b: number): string => b.toString(16).padStart(2, "0")).join("");
+  const signatureHash: string = hashArray
+    .map((b: number): string => b.toString(16).padStart(2, "0"))
+    .join("");
 
   return {
     signatureHash,
     signatureData,
     signatureTimestamp,
-    verificationItemId: context.itemID
+    verificationItemId: context.itemID,
   };
 }

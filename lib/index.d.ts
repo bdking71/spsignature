@@ -1,3 +1,3 @@
 export * from "./ProvisioningService";
-export * from "./VerificationService";
+export * from "./OtpService";
 export * from "./TransactionSigner";

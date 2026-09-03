@@ -1,28 +1,54 @@
 {
   "name": "@bdking71/spsignature",
-  "version": "1.0.5",
-  "description": "SharePoint Framework WebPart isolated digital signing and provisioning engine.",
+  "version": "1.1.0",
+  "description": "SharePoint Framework isolated digital signing, LZW compression, and OTP audit engine.",
   "main": "lib/index.js",
+  "module": "lib/index.js",
   "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    }
+  },
   "files": [
     "lib"
   ],
   "scripts": {
     "clean": "rimraf lib",
-    "build": "tsc --build",
-    "prepare": "npm run build"
+    "build": "npm run clean && tsc",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run build"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "keywords": [
     "spfx",
     "sharepoint",
+    "sharepoint-online",
     "pnp",
     "digital-signature",
-    "audit"
+    "2fa",
+    "otp",
+    "audit",
+    "m365"
   ],
-  "author": "Your Organization Name",
+  "author": {
+    "name": "Bryan King",
+    "url": "https://bdking71.wordpress.com"
+  },
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bdking71/spsignature.git"
+  },
+  "bugs": {
+    "url": "https://github.com/bdking71/spsignature/issues"
+  },
+  "homepage": "https://github.com/bdking71/spsignature#readme",
   "peerDependencies": {
-    "@microsoft/sp-webpart-base": ">=1.18.0",
+    "@microsoft/sp-webpart-base": ">=1.15.0",
     "@pnp/sp": ">=3.0.0"
   },
   "devDependencies": {
@@ -30,13 +56,5 @@
     "@pnp/sp": "^3.0.0",
     "rimraf": "^5.0.0",
     "typescript": "~5.3.3"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/bdking71/spsignature"
-  },
-  "bugs": {
-    "url": "https://github.com/bdking71/spsignature/issues"
-  },
-  "homepage": "https://github.com/bdking71/spsignature#readme"
+  }
 }

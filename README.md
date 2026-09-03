@@ -1,84 +1,148 @@
 # @bdking71/spsignature
-# NOT READY FOR PRODUCTION USE! Please do not use at this time. #
-@bdking71/spsignature provides a secure, lightweight, and framework-agnostic digital signature module engineered specifically for Microsoft 365 environments. Built to run inside custom SPFx Web Parts and Extension Application Customizers, it delivers tamper-evident signature collection, automated base64 image encoding, and structured payload generation directly integrated with SharePoint Online list infrastructure.
 
-Key Capabilities & Business Value
+[![GitHub Repository](https://img.shields.io/badge/GitHub-Repository-blue?logo=github)](https://github.com/bdking71/spsignature)
+[![npm version](https://img.shields.io/npm/v/@bdking71/spsignature.svg)](https://www.npmjs.com/package/@bdking71/spsignature)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-- Zero Infrastructure Overhead: Operates entirely within client-side M365 contexts—no external APIs, azure functions, or third-party storage backends required.
+> ⚠️ **NOT READY FOR PRODUCTION USE!** This module is currently under active development. Please do not use it in production environments at this time.
 
-- Cross-Platform M365 Integration: Designed for seamless deployment across SharePoint Online, Microsoft Teams, and Viva Connections desktop/mobile experiences.
+`@bdking71/spsignature` provides a secure, lightweight, and framework-agnostic digital signature module engineered specifically for Microsoft 365 environments. Built to run inside custom SPFx Web Parts and Extension Application Customizers, it delivers tamper-evident signature collection, automated base64 image encoding, and structured payload generation directly integrated with SharePoint Online list infrastructure.
 
-- Integrity & Non-Repudiation: Generates cryptographic SHA-256 hashes bound to user identities, timestamps, and target record IDs to prevent signature tampering.
+---
 
-- Standardized JSON Payload: Encapsulates complete signing metadata inside standard SharePoint Multiline Text columns (Plain Text / JSON formatted) for effortless integration with Power Automate and Power BI.
+## Source Code & Repository
 
-## Two-Factor Authentication (2FA / TFA) Architecture
+* **GitHub Repository:** [https://github.com/bdking71/spsignature](https://github.com/bdking71/spsignature)
+* **Issues & Feedback:** [https://github.com/bdking71/spsignature/issues](https://github.com/bdking71/spsignature/issues)
+* **NPM Package:** [@bdking71/spsignature](https://www.npmjs.com/package/@bdking71/spsignature)
 
-To enforce non-repudiation and meet compliance standards, @bdking71/spsignature includes a flexible Two-Factor Authentication engine. Rather than relying on rigid third-party SMS gateways, it delegates code delivery to Power Automate, allowing organizations to route standard 6-digit verification codes via Microsoft Teams, Outlook Email, or both.
+---
+
+## Key Capabilities & Business Value
+
+- **Zero Infrastructure Overhead**: Operates entirely within client-side M365 contexts — no external APIs, Azure Functions, or third-party storage backends required.
+- **Cross-Platform M365 Integration**: Designed for seamless deployment across SharePoint Online, Microsoft Teams, and Viva Connections desktop/mobile experiences.
+- **Integrity & Non-Repudiation**: Generates cryptographic SHA-256 hashes bound to user identities, timestamps, and target record IDs to prevent signature tampering.
+- **Standardized JSON Payload**: Encapsulates complete signing metadata inside standard SharePoint Multiline Text columns (Plain Text / JSON formatted) for effortless integration with Power Automate and Power BI.
+- **LZW Compression**: Automatically compresses signature image payloads to minimize SharePoint storage footprint.
+- **Signature Caching**: Optional local device caching so users don't have to re-draw their signature on every transaction.
+
+---
+
+## Two-Factor Authentication (2FA) Architecture
+
+To enforce non-repudiation and meet compliance standards, `@bdking71/spsignature` includes a flexible Two-Factor Authentication engine. Rather than relying on rigid third-party SMS gateways, it delegates code delivery to **Power Automate**, allowing organizations to route standard **5-digit** verification codes via Microsoft Teams, Outlook Email, or both.
 
 ![Diagram illustrating the 2FA workflow between SPFx, SharePoint, and Power Automate](./img/tfa.jpg)
 
-## How The 2FA Workflow Operates-
-- Code Generation: When a user initiates a signing transaction, the component generates a cryptographically secure, time-sensitive verification code (e.g., 849204) and registers a pending transaction state.
+### How the 2FA Workflow Operates
 
-- Power Automate Trigger: The component triggers a light HTTP webhook or writes a record to a dedicated SharePoint verification list.
+1. **Code Generation**: When a user initiates a signing transaction, the component generates a cryptographically secure 5-digit verification code (e.g., `84920`) using the Web Crypto API.
+2. **SharePoint Queue**: The component writes a record to the dedicated `PendingVerifications` SharePoint list, secured with item-level permissions so users can only see their own codes.
+3. **Power Automate Trigger**: A Power Automate flow monitors the list and instantly dispatches the code to the signer via:
+   - **Microsoft Teams**: Direct Adaptive Card or Activity Feed notification.
+   - **Outlook Email**: High-priority internal notification.
+4. **Validation & Signing**: The signer enters the 5-digit code into the `@bdking71/spsignature` UI component. Upon successful validation, the final signed JSON payload is generated and stored in the target record.
 
-- Multi-Channel Delivery: The Power Automate flow instantly dispatches the code to the signer via:
-
-- Microsoft Teams: Direct Adaptive Card or Activity Feed notification.
-
-- Outlook Email: High-priority internal notification.
-
-- Validation & Signing: The signer enters the 6-digit code into the @bdking71/spsignature UI component. Upon successful validation, the final signed JSON payload is generated and stored in the target record.
+---
 
 ## Signature Data Schema
 
-The module returns a single, structured JSON object designed to be stored directly inside a SharePoint Multiple lines of text field (Plain Text format):
+The module returns a single, structured JSON object designed to be stored directly inside a SharePoint **Multiple lines of text** field (Plain Text format):
 
-```JSON
+```json
 {
-  "signatureHash": "e3b0c4429 ...",
-  "signatureData": "data:image/png;base64,iVB....",
+  "signatureHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "signatureData": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA...",
   "signatureTimestamp": "2026-08-31T19:55:06.121Z",
-  "verificationItemId": 1
+  "verificationItemId": 42
 }
 ```
 
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `signatureHash` | `string` | SHA-256 hex digest of the canonical audit envelope (payload + signer + timestamp). |
+| `signatureData` | `string` | LZW-compressed data-URI of the signature image (PNG). |
+| `signatureTimestamp` | `string` | ISO-8601 timestamp captured at the moment of signing. |
+| `verificationItemId` | `number` | ID of the corresponding record in the `PendingVerifications` list. |
+
+---
 
 ## Toolchain & Compatibility Matrix
 
 This project requires a precise local environment build. Strict adherence to the versioning matrix is mandatory to prevent toolchain compilation errors.
 
-* **SPFx Version:** `v1.22.1`
-* **Node.js:** `v18.17.1` (Recommended use of `nvm` or `nvs`)
-* **Gulp CLI:** `v4.x`
-* **Primary UI Framework:** React `v17.0.1` / Fluent UI `v8.x`
+| Component | Version |
+| :--- | :--- |
+| **SPFx** | `v1.22.1` |
+| **Node.js** | `v18.17.1` (Recommended use of `nvm` or `nvs`) |
+| **Gulp CLI** | `v4.x` |
+| **React** | `v17.0.1` |
+| **Fluent UI** | `v8.x` |
+| **TypeScript** | `v4.7+` |
 
-## Quick Start & Local Development
+---
 
-Execute these commands in sequence to establish your local development runtime:
+## Installation
+
+Install the package into your SPFx solution:
+
+```bash
+npm install @bdking71/spsignature --save
+```
+
+### Peer Dependencies
+
+Ensure the following peer dependencies are installed in your SPFx project:
+
+```bash
+npm install @pnp/sp @microsoft/sp-webpart-base --save
+```
+
+---
 
 ## Integration & Usage Guide
 
-### Provision Infrastructure
-Call `ensurePendingVerificationsList` during the WebPart lifecycle (e.g., inside `onInit()`) to automatically ensure the required `PendingVerifications` SharePoint list and columns exist on the site collection[cite: 2].
+### Step 1: Provision SharePoint Infrastructure
+
+Call `ensurePendingVerificationsList` during the web part lifecycle (inside `onInit()`) to automatically ensure the `PendingVerifications` SharePoint list, columns, and item-level security settings exist on the current site collection.
+
+> **Note:** This method is fully **idempotent**—it can be safely called on every web part load without failing or duplicating columns.
 
 ```typescript
 import { ensurePendingVerificationsList } from "@bdking71/spsignature";
 
-public async onInit(): Promise<void> {
-  await super.onInit();
+export default class MySignatureWebPart extends BaseClientSideWebPart<IMySignatureWebPartProps> {
 
-  // Ensures 'PendingVerifications' list with 'Passcode' and 'Channel' fields exists
-  await ensurePendingVerificationsList({ context: this.context });
+  public async onInit(): Promise<void> {
+    await super.onInit();
+
+    // Provisions the 'PendingVerifications' list with 'Passcode' and 'Channel' columns
+    await ensurePendingVerificationsList({ context: this.context });
+  }
 }
 ```
 
-### Launch Signature Modal & Capture Audit
+### Step 2: Configure Your Power Automate Flow
 
-Execute promptAndGenerateSecureAudit within your component or event handler. This renders an enterprise modal overlay that handles draw, upload, or cached signature selection, triggers 2FA code delivery, validates the 5-digit passcode, and outputs a cryptographic audit payload.
+Create a Power Automate flow that triggers on **"When an item is created"** for the `PendingVerifications` list. The flow should:
 
-```TypeScript
+1. Read the `Title` (signer email), `Passcode`, and `Channel` columns.
+2. Route notification based on the `Channel` value:
+   - `"email"` → Send an Outlook email with the passcode.
+   - `"teams"` → Post an Adaptive Card to the user in Microsoft Teams.
+   - `"both"` → Dispatch through both channels simultaneously.
+3. Optionally delete the item after dispatch (or use a scheduled cleanup flow to purge expired codes).
+
+### Step 3: Launch Signature Modal & Capture Audit
+
+Execute `promptAndGenerateSecureAudit` within your component or event handler. This renders an enterprise modal overlay that:
+- Handles drawn, uploaded, or cached signature selection.
+- Triggers 2FA code delivery through the configured channel.
+- Validates the 5-digit passcode.
+- Outputs a cryptographic audit payload.
+
+```typescript
 import {
   promptAndGenerateSecureAudit,
   SharePointAuditRecord
@@ -108,11 +172,18 @@ private handleSignAction = async (): Promise<void> => {
     console.log("Compressed Image Data:", auditRecord.signatureData);
     console.log("Timestamp:", auditRecord.signatureTimestamp);
     console.log("Verification Log ID:", auditRecord.verificationItemId);
+
+    // Example: Persist to a SharePoint list column named "SignatureAudit"
+    await sp.web.lists.getByTitle("Requisitions").items.getById(1042).update({
+      SignatureAudit: JSON.stringify(auditRecord)
+    });
+  } else {
+    console.log("User cancelled the signature workflow.");
   }
 };
 ```
 
-### Verification & Image Reconstruction
+### Step 4: Verification & Image Reconstruction
 
 To verify non-repudiation or render the stored LZW-compressed signature image back into a view or report, use the built-in helper utilities.
 
@@ -124,22 +195,88 @@ import {
 
 // 1. Re-calculate SHA-256 hash to verify record integrity
 const isValid: boolean = await verifySecureAuditRecord(
-  payload,
-  signerEmail,
-  timestamp,
-  compressedSignatureData,
-  storedHash
+  payload,                  // Original payload object
+  signerEmail,              // Signer's email address
+  timestamp,                // ISO-8601 timestamp from the audit record
+  compressedSignatureData,  // Retained for API symmetry
+  storedHash                // The stored signatureHash to compare against
 );
+
+if (isValid) {
+  console.log("✓ Signature is authentic and untampered.");
+} else {
+  console.warn("✗ Signature verification failed - record may be tampered.");
+}
 
 // 2. Decompress LZW signature string into a standard PNG base64 Data-URI
 const renderableImageSrc: string = getReportableSignature(compressedSignatureData);
+
+// Use directly in an <img> tag:
+// <img src={renderableImageSrc} alt="Signature" />
 ```
 
-# License
+---
+
+## API Reference
+
+### Exported Functions
+
+| Function | Purpose |
+| :--- | :--- |
+| `ensurePendingVerificationsList(props)` | Idempotently provisions the `PendingVerifications` SharePoint list, its required columns, and item-level security. |
+| `promptAndGenerateSecureAudit(context, title?, msg?)` | Launches the signature modal, dispatches the OTP, validates entry, and returns a `SharePointAuditRecord`. |
+| `verifySecureAuditRecord(payload, signer, timestamp, sigData, hash)` | Re-computes the SHA-256 hash to verify audit-record integrity. |
+| `getReportableSignature(compressedSignatureData)` | Decompresses an LZW-compressed signature back into a viewable `data:image/png` URI. |
+
+### Exported Types
+
+| Type | Description |
+| :--- | :--- |
+| `SharePointAuditRecord` | Structured JSON audit payload returned after successful signing. |
+| `SignerContext` | Input parameters for the signature workflow. |
+| `AuditEnvelopeRecord` | Canonical envelope structure used for hashing (payload + signer + timestamp). |
+| `DeliveryChannel` | `"email" \| "teams" \| "both"` — Supported OTP delivery channels. |
+
+---
+
+## Security Considerations
+
+- **Client-Side Passcode Generation**: The 5-digit OTP is generated and validated in the browser using the Web Crypto API. This is well-suited for **enterprise workflow enforcement** (approvals, sign-offs, SOP compliance) but is not intended to replace hardened server-side MFA solutions for high-risk financial transactions.
+- **Item-Level Security**: The `PendingVerifications` list is automatically configured with `ReadSecurity = 2` and `WriteSecurity = 2`, meaning users can only view and edit records they created. This prevents users from inspecting other users' active passcodes.
+- **SHA-256 Non-Repudiation**: The signature hash binds the payload, signer identity, and timestamp together. Any modification to the stored record can be detected through `verifySecureAuditRecord()`.
+- **Signature Caching**: Cached signatures are stored in browser `localStorage` after LZW compression. Consumers should clearly communicate this caching behavior to end users to meet compliance and privacy requirements (GDPR, CCPA, etc.).
+
+---
+
+## Troubleshooting
+
+| Issue | Resolution |
+| :--- | :--- |
+| Modal never appears | Ensure `spContext` is a valid `WebPartContext` and the DOM is fully loaded. |
+| OTP never arrives | Verify the Power Automate flow is active and listening on the correct list. Check the flow run history. |
+| "Field name already exists" | This shouldn't happen due to idempotency, but ensure you're on the latest version of the module. |
+| SHA-256 verification fails on nested objects | Note: Only top-level payload keys are sorted. Deeply nested objects should have consistent key ordering. |
+| Signature not caching | Verify browser `localStorage` isn't in private/incognito mode or blocked by browser policy. |
+
+---
+
+## Contributing
+
+Contributions, issues, and feature requests are welcome!
+
+1. Fork the Project: [https://github.com/bdking71/spsignature](https://github.com/bdking71/spsignature)
+2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
+3. Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
+4. Push to the Branch (`git push origin feature/AmazingFeature`)
+5. Open a Pull Request
+
+---
+
+## License
 
 MIT License
 
-Copyright (C) 2012 Veselin Todorov
+Copyright (c) 2025 bdking71
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
 
