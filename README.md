@@ -6,17 +6,15 @@
 
 > ⚠️ **NOT READY FOR PRODUCTION USE!** This module is currently under active development. Please do not use it in production environments at this time.
 
-![Approve Purchase Requisition Screen](/img/SignatureScreen.png)
-
 `@bdking71/spsignature` provides a secure, lightweight, and framework-agnostic digital signature module engineered specifically for Microsoft 365 environments. Built to run inside custom SPFx Web Parts and Extension Application Customizers, it delivers tamper-evident signature collection, automated base64 image encoding, and structured payload generation directly integrated with SharePoint Online list infrastructure.
 
 ---
 
 ## Source Code & Repository
 
-* **GitHub Repository:** [https://github.com/bdking71/spsignature](https://github.com/bdking71/spsignature)
-* **Issues & Feedback:** [https://github.com/bdking71/spsignature/issues](https://github.com/bdking71/spsignature/issues)
-* **NPM Package:** [@bdking71/spsignature](https://www.npmjs.com/package/@bdking71/spsignature)
+* **GitHub Repository:** https://github.com/bdking71/spsignature
+* **Issues & Feedback:** https://github.com/bdking71/spsignature/issues
+* **NPM Package:** https://www.npmjs.com/package/@bdking71/spsignature
 
 ---
 
@@ -25,17 +23,16 @@
 - **Zero Infrastructure Overhead**: Operates entirely within client-side M365 contexts — no external APIs, Azure Functions, or third-party storage backends required.
 - **Cross-Platform M365 Integration**: Designed for seamless deployment across SharePoint Online, Microsoft Teams, and Viva Connections desktop/mobile experiences.
 - **Integrity & Non-Repudiation**: Generates cryptographic SHA-256 hashes bound to user identities, timestamps, and target record IDs to prevent signature tampering.
-- **Standardized JSON Payload**: Encapsulates complete signing metadata inside standard SharePoint Multiline Text columns (Plain Text / JSON formatted) for effortless integration with Power Automate and Power BI.
+- **Standardized JSON Payload**: Encapsulates complete signing metadata inside standard SharePoint Multiline Text columns for effortless integration with Power Automate and Power BI.
 - **LZW Compression**: Automatically compresses signature image payloads to minimize SharePoint storage footprint.
 - **Signature Caching**: Optional local device caching so users don't have to re-draw their signature on every transaction.
+- **React Component Display**: Built-in `SignatureDisplay` React component for displaying verified signatures with full styling control.
 
 ---
 
 ## Two-Factor Authentication (2FA) Architecture
 
 To enforce non-repudiation and meet compliance standards, `@bdking71/spsignature` includes a flexible Two-Factor Authentication engine. Rather than relying on rigid third-party SMS gateways, it delegates code delivery to **Power Automate**, allowing organizations to route standard **5-digit** verification codes via Microsoft Teams, Outlook Email, or both.
-
-![Diagram illustrating the 2FA workflow between SPFx, SharePoint, and Power Automate](/img/TFA.jpg)
 
 ### How the 2FA Workflow Operates
 
@@ -50,9 +47,9 @@ To enforce non-repudiation and meet compliance standards, `@bdking71/spsignature
 
 ## Signature Data Schema
 
-The module returns a single, structured JSON object designed to be stored directly inside a SharePoint **Multiple lines of text** field (Plain Text format):
+The module returns a single, structured JSON object designed to be stored directly inside a SharePoint **Multiple lines of text** field:
 
-```json
+```
 {
   "signatureHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "signatureData": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA...",
@@ -89,7 +86,7 @@ This project requires a precise local environment build. Strict adherence to the
 
 Install the package into your SPFx solution:
 
-```bash
+```
 npm install @bdking71/spsignature --save
 ```
 
@@ -97,8 +94,8 @@ npm install @bdking71/spsignature --save
 
 Ensure the following peer dependencies are installed in your SPFx project:
 
-```bash
-npm install @pnp/sp @microsoft/sp-webpart-base --save
+```
+npm install @pnp/sp @microsoft/sp-webpart-base react --save
 ```
 
 ---
@@ -109,9 +106,9 @@ npm install @pnp/sp @microsoft/sp-webpart-base --save
 
 Call `ensurePendingVerificationsList` during the web part lifecycle (inside `onInit()`) to automatically ensure the `PendingVerifications` SharePoint list, columns, and item-level security settings exist on the current site collection.
 
-> **Note:** This method is fully **idempotent**—it can be safely called on every web part load without failing or duplicating columns.
+Note: This method is fully **idempotent**—it can be safely called on every web part load without failing or duplicating columns.
 
-```typescript
+```
 import { ensurePendingVerificationsList } from "@bdking71/spsignature";
 
 export default class MySignatureWebPart extends BaseClientSideWebPart<IMySignatureWebPartProps> {
@@ -140,11 +137,11 @@ Create a Power Automate flow that triggers on **"When an item is created"** for 
 
 Execute `promptAndGenerateSecureAudit` within your component or event handler. This renders an enterprise modal overlay that:
 - Handles drawn, uploaded, or cached signature selection.
-- Triggers 2FA code delivery through the configured channel.
-- Validates the 5-digit passcode.
+- Triggers 2FA code delivery through the configured channel (when enabled).
+- Validates the 5-digit passcode (if TFA is required).
 - Outputs a cryptographic audit payload.
 
-```typescript
+```
 import {
   promptAndGenerateSecureAudit,
   SharePointAuditRecord
@@ -153,10 +150,10 @@ import {
 private handleSignAction = async (): Promise<void> => {
   const auditRecord: SharePointAuditRecord | undefined = await promptAndGenerateSecureAudit(
     {
-      itemID: 1042, // Record/Item ID being signed
+      itemID: 1042,
       signer: this.context.pageContext.user.email,
       spContext: this.context,
-      channel: "teams", // Code delivery route: "teams" | "email" | "both"
+      channel: "teams",
       requireTFA: true,
       payload: {
         DocumentTitle: "Purchase Requisition #4402",
@@ -169,27 +166,23 @@ private handleSignAction = async (): Promise<void> => {
   );
 
   if (auditRecord) {
-    // Save auditRecord JSON payload directly to your SharePoint multiline text column
     console.log("Signature Hash:", auditRecord.signatureHash);
     console.log("Compressed Image Data:", auditRecord.signatureData);
     console.log("Timestamp:", auditRecord.signatureTimestamp);
     console.log("Verification Log ID:", auditRecord.verificationItemId);
 
-    // Example: Persist to a SharePoint list column named "SignatureAudit"
     await sp.web.lists.getByTitle("Requisitions").items.getById(1042).update({
       SignatureAudit: JSON.stringify(auditRecord)
     });
-  } else {
-    console.log("User cancelled the signature workflow.");
   }
 };
 ```
 
 ### Step 4: Verification & Image Reconstruction
 
-To verify non-repudiation or render the stored LZW-compressed signature image back into a view or report, use the built-in helper utilities.
+To verify non-repudiation or render the stored signature back into a view or report, use the built-in helper utilities.
 
-```typescript
+```
 import {
   verifySecureAuditRecord,
   getReportableSignature
@@ -197,11 +190,9 @@ import {
 
 // 1. Re-calculate SHA-256 hash to verify record integrity
 const isValid: boolean = await verifySecureAuditRecord(
-  payload,                  // Original payload object
-  signerEmail,              // Signer's email address
-  timestamp,                // ISO-8601 timestamp from the audit record
-  compressedSignatureData,  // Retained for API symmetry
-  storedHash                // The stored signatureHash to compare against
+  auditRecord,
+  signerEmail,
+  payload
 );
 
 if (isValid) {
@@ -210,12 +201,86 @@ if (isValid) {
   console.warn("✗ Signature verification failed - record may be tampered.");
 }
 
-// 2. Decompress LZW signature string into a standard PNG base64 Data-URI
-const renderableImageSrc: string = getReportableSignature(compressedSignatureData);
-
-// Use directly in an <img> tag:
-// <img src={renderableImageSrc} alt="Signature" />
+// 2. Decompress LZW signature string into a viewable PNG Data-URI
+const renderableImageSrc: string = getReportableSignature(auditRecord.signatureData);
 ```
+
+### Step 5: Display Signature with React Component
+
+Use the built-in `SignatureDisplay` React component to render a verified signature with customizable styling:
+
+```
+import React from "react";
+import {
+  SignatureDisplay,
+  SharePointAuditRecord,
+  verifySecureAuditRecord
+} from "@bdking71/spsignature";
+
+export const MySignatureViewer: React.FC = () => {
+  const [auditRecord, setAuditRecord] = React.useState<SharePointAuditRecord | null>(null);
+  const [isValid, setIsValid] = React.useState(false);
+
+  React.useEffect(() => {
+    const verifySignature = async () => {
+      if (!auditRecord) return;
+
+      const valid = await verifySecureAuditRecord(
+        auditRecord,
+        "user@example.com",
+        { amount: 1500, vendor: "Contoso" }
+      );
+      setIsValid(valid);
+    };
+
+    verifySignature();
+  }, [auditRecord]);
+
+  if (!auditRecord) {
+    return <div>No signature to display.</div>;
+  }
+
+  return (
+    <div>
+      <h1>Purchase Requisition #4402</h1>
+
+      <SignatureDisplay
+        auditRecord={auditRecord}
+        isValid={isValid}
+        style={{
+          padding: "24px",
+          border: "2px solid #0078d4",
+          backgroundColor: "#f0f7ff",
+          marginTop: "20px",
+          borderRadius: "12px",
+        }}
+      />
+
+      <SignatureDisplay
+        auditRecord={auditRecord}
+        isValid={isValid}
+        className="my-signature-card"
+      />
+    </div>
+  );
+};
+```
+
+#### SignatureDisplay Component Props
+
+| Prop | Type | Required | Description |
+| :--- | :--- | :--- | :--- |
+| `auditRecord` | `SharePointAuditRecord` | Yes | The signature audit record returned from `promptAndGenerateSecureAudit()` |
+| `isValid` | `boolean` | Yes | Result from `verifySecureAuditRecord()` — displayed in green or red |
+| `className` | `string` | No | CSS class name for custom styling |
+| `style` | `React.CSSProperties` | No | Inline CSS styles for the root container |
+
+The SignatureDisplay component renders:
+- Signature image preview
+- Signer name/email
+- Validation status (green for valid, red for invalid)
+- ISO-8601 timestamp converted to local timezone
+- SHA-256 hash digest (truncated, light gray font)
 
 ---
 
@@ -225,9 +290,9 @@ const renderableImageSrc: string = getReportableSignature(compressedSignatureDat
 
 | Function | Purpose |
 | :--- | :--- |
-| `ensurePendingVerificationsList(props)` | Idempotently provisions the `PendingVerifications` SharePoint list, its required columns, and item-level security. |
+| `ensurePendingVerificationsList(props)` | Idempotently provisions the `PendingVerifications` SharePoint list, columns, and item-level security. |
 | `promptAndGenerateSecureAudit(context, title?, msg?)` | Launches the signature modal, dispatches the OTP, validates entry, and returns a `SharePointAuditRecord`. |
-| `verifySecureAuditRecord(payload, signer, timestamp, sigData, hash)` | Re-computes the SHA-256 hash to verify audit-record integrity. |
+| `verifySecureAuditRecord(auditRecord, signer, payload)` | Re-computes the SHA-256 hash to verify audit-record integrity. |
 | `getReportableSignature(compressedSignatureData)` | Decompresses an LZW-compressed signature back into a viewable `data:image/png` URI. |
 
 ### Exported Types
@@ -238,6 +303,13 @@ const renderableImageSrc: string = getReportableSignature(compressedSignatureDat
 | `SignerContext` | Input parameters for the signature workflow. |
 | `AuditEnvelopeRecord` | Canonical envelope structure used for hashing (payload + signer + timestamp). |
 | `DeliveryChannel` | `"email" \| "teams" \| "both"` — Supported OTP delivery channels. |
+| `ISignatureDisplayProps` | Props interface for the `SignatureDisplay` React component. |
+
+### Exported React Components
+
+| Component | Purpose |
+| :--- | :--- |
+| `SignatureDisplay` | Renders a verified signature with signer info, validation status, timestamp, and hash digest. Fully customizable via props. |
 
 ---
 
@@ -256,9 +328,9 @@ const renderableImageSrc: string = getReportableSignature(compressedSignatureDat
 | :--- | :--- |
 | Modal never appears | Ensure `spContext` is a valid `WebPartContext` and the DOM is fully loaded. |
 | OTP never arrives | Verify the Power Automate flow is active and listening on the correct list. Check the flow run history. |
-| "Field name already exists" | This shouldn't happen due to idempotency, but ensure you're on the latest version of the module. |
 | SHA-256 verification fails on nested objects | Note: Only top-level payload keys are sorted. Deeply nested objects should have consistent key ordering. |
 | Signature not caching | Verify browser `localStorage` isn't in private/incognito mode or blocked by browser policy. |
+| SignatureDisplay not rendering | Ensure React is installed and `auditRecord` is properly populated with valid audit data. |
 
 ---
 
@@ -266,10 +338,10 @@ const renderableImageSrc: string = getReportableSignature(compressedSignatureDat
 
 Contributions, issues, and feature requests are welcome!
 
-1. Fork the Project: [https://github.com/bdking71/spsignature](https://github.com/bdking71/spsignature)
-2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the Branch (`git push origin feature/AmazingFeature`)
+1. Fork the Project: https://github.com/bdking71/spsignature
+2. Create your Feature Branch (git checkout -b feature/AmazingFeature)
+3. Commit your Changes (git commit -m 'Add some AmazingFeature')
+4. Push to the Branch (git push origin feature/AmazingFeature)
 5. Open a Pull Request
 
 ---
