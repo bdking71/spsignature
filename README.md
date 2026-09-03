@@ -6,6 +6,8 @@
 
 > ⚠️ **NOT READY FOR PRODUCTION USE!** This module is currently under active development. Please do not use it in production environments at this time.
 
+![Approve Purchase Requisition Screen](/img/SignatureScreen.png)
+
 `@bdking71/spsignature` provides a secure, lightweight, and framework-agnostic digital signature module engineered specifically for Microsoft 365 environments. Built to run inside custom SPFx Web Parts and Extension Application Customizers, it delivers tamper-evident signature collection, automated base64 image encoding, and structured payload generation directly integrated with SharePoint Online list infrastructure.
 
 ---
@@ -33,7 +35,7 @@
 
 To enforce non-repudiation and meet compliance standards, `@bdking71/spsignature` includes a flexible Two-Factor Authentication engine. Rather than relying on rigid third-party SMS gateways, it delegates code delivery to **Power Automate**, allowing organizations to route standard **5-digit** verification codes via Microsoft Teams, Outlook Email, or both.
 
-![Diagram illustrating the 2FA workflow between SPFx, SharePoint, and Power Automate](./img/tfa.jpg)
+![Diagram illustrating the 2FA workflow between SPFx, SharePoint, and Power Automate](/img/tfa.jpg)
 
 ### How the 2FA Workflow Operates
 
