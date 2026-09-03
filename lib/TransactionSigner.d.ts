@@ -109,23 +109,34 @@ export declare function promptAndGenerateSecureAudit(context: SignerContext, mod
 export declare function getReportableSignature(compressedSignatureData: string): string;
 /**
  * Re-computes the SHA-256 hash of the audit envelope constructed from
- * the supplied parameters and compares it to `storedHash`.
+ * the supplied parameters and compares it to the stored hash.
  *
  * This allows any consumer to independently verify that a signed
  * record has not been tampered with, without needing access to the
  * original signature image.
  *
- * **Note:** Only top-level payload keys are sorted.  If your payload
+ * **Note:** Only top-level payload keys are sorted. If your payload
  * contains nested objects whose key order may vary, consider using a
  * deep-sort utility before calling this function.
  *
- * @param payloadToVerify         - The payload that was originally signed.
- * @param signer                  - The signer identifier used at sign time.
- * @param timestamp               - The ISO-8601 timestamp captured at sign
- *                                  time.
- * @param _compressedSignatureData - The compressed signature (unused by the
- *                                  hash, retained for API symmetry).
- * @param storedHash              - The SHA-256 hex digest to compare against.
- * @returns `true` if the recomputed hash matches `storedHash`.
+ * @param auditRecord - The SharePointAuditRecord returned from `promptAndGenerateSecureAudit`.
+ * @param signer      - The signer's email address or display name (must match original signer).
+ * @param payload     - The original payload object that was signed.
+ * @returns `true` if the signature hash is valid and authentic.
+ *
+ * @example
+ * ```ts
+ * const isValid = await verifySecureAuditRecord(
+ *   auditRecord,
+ *   "user@example.com",
+ *   { amount: 1500, vendor: "Contoso" }
+ * );
+ *
+ * if (isValid) {
+ *   console.log("Signature is authentic!");
+ * } else {
+ *   console.warn("Signature has been tampered with!");
+ * }
+ * ```
  */
-export declare function verifySecureAuditRecord(payloadToVerify: Record<string, unknown>, signer: string, timestamp: string, _compressedSignatureData: string, storedHash: string): Promise<boolean>;
+export declare function verifySecureAuditRecord(auditRecord: SharePointAuditRecord, signer: string, payload: Record<string, unknown>): Promise<boolean>;

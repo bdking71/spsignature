@@ -35,7 +35,7 @@
 
 To enforce non-repudiation and meet compliance standards, `@bdking71/spsignature` includes a flexible Two-Factor Authentication engine. Rather than relying on rigid third-party SMS gateways, it delegates code delivery to **Power Automate**, allowing organizations to route standard **5-digit** verification codes via Microsoft Teams, Outlook Email, or both.
 
-![Diagram illustrating the 2FA workflow between SPFx, SharePoint, and Power Automate](/img/tfa.jpg)
+![Diagram illustrating the 2FA workflow between SPFx, SharePoint, and Power Automate](/img/TFA.jpg)
 
 ### How the 2FA Workflow Operates
 
