@@ -1,6 +1,6 @@
 {
   "name": "@bdking71/spsignature",
-  "version": "1.3.3",
+  "version": "1.3.4",
   "description": "SharePoint Framework isolated digital signing, LZW compression, and OTP audit engine.",
   "main": "lib/index.js",
   "module": "lib/index.js",
