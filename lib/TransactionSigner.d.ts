@@ -1,5 +1,5 @@
 /**
- * @file SecureAuditSignature.ts
+ * @file TransactionSigner.ts
  *
  * Provides a secure, auditable digital-signature workflow for SharePoint
  * web parts.  The module renders a modal dialog that supports:
@@ -36,7 +36,7 @@ export interface SignerContext {
     channel?: DeliveryChannel;
     /**
      * Whether two-factor authentication is required.
-     * Defaults to `true` when omitted or set to `undefined`.
+     * **Defaults to `false` (disabled).** Set to `true` to enable TFA.
      */
     requireTFA?: boolean;
 }
@@ -90,7 +90,7 @@ export interface AuditEnvelopeRecord {
  *   payload: { amount: 1500, vendor: "Contoso" },
  *   spContext: this.context,
  *   channel: "email",
- *   requireTFA: true,
+ *   requireTFA: true,  // Enable TFA
  * });
  * ```
  */

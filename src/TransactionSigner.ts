@@ -1,5 +1,5 @@
 /**
- * @file SecureAuditSignature.ts
+ * @file TransactionSigner.ts
  *
  * Provides a secure, auditable digital-signature workflow for SharePoint
  * web parts.  The module renders a modal dialog that supports:
@@ -48,7 +48,7 @@ export interface SignerContext {
   channel?: DeliveryChannel;
   /**
    * Whether two-factor authentication is required.
-   * Defaults to `true` when omitted or set to `undefined`.
+   * **Defaults to `false` (disabled).** Set to `true` to enable TFA.
    */
   requireTFA?: boolean;
 }
@@ -126,7 +126,7 @@ function generateFiveDigitPasscode(): string {
  *   payload: { amount: 1500, vendor: "Contoso" },
  *   spContext: this.context,
  *   channel: "email",
- *   requireTFA: true,
+ *   requireTFA: true,  // Enable TFA
  * });
  * ```
  */
@@ -142,9 +142,12 @@ export async function promptAndGenerateSecureAudit(
   }
 
   return new Promise<SharePointAuditRecord | undefined>((resolve): void => {
-    const requireTFA = context.requireTFA !== false;
+    // TFA is only enabled if explicitly set to true
+    const requireTFA = context.requireTFA === true;
     const generatedPasscode = generateFiveDigitPasscode();
     let storedVerificationItemId: number | undefined = undefined;
+
+    console.log("TFA Enabled:", requireTFA); // DEBUG
 
     // -----------------------------------------------------------------
     // Overlay
