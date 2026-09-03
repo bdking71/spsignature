@@ -719,34 +719,74 @@ export async function promptAndGenerateSecureAudit(
     const updateButtonState = (): void => {
       let isCodeValid = true;
 
-      if (requireTFA && verificationInput) {
-        const codeValue = verificationInput.value.trim();
-        isCodeValid =
-          codeValue.length === 5 && codeValue === generatedPasscode;
+      // Check TFA only if it's required
+      if (requireTFA) {
+        if (verificationInput) {
+          const codeValue = verificationInput.value.trim();
+          isCodeValid =
+            codeValue.length === 5 && codeValue === generatedPasscode;
+          console.log(
+            "🔐 TFA Check: Code =",
+            codeValue,
+            "Valid =",
+            isCodeValid
+          );
+        } else {
+          isCodeValid = false;
+          console.log("🔐 TFA Check: No input element found");
+        }
+      } else {
+        console.log("🔐 TFA not required - skipping TFA validation");
       }
 
+      // Check signature validity
       let isSignatureValid = false;
       if (activeMode === "cached") {
         isSignatureValid = hasCachedSignature;
+        console.log("✍️ Signature Check (CACHED): Valid =", isSignatureValid);
       } else if (activeMode === "draw") {
-        isSignatureValid =
-          hasDrawnContent &&
-          ctx !== null &&
-          !isCanvasEmpty(ctx, canvas.width, canvas.height);
+        const canvasHasContent =
+          ctx !== null && !isCanvasEmpty(ctx, canvas.width, canvas.height);
+        isSignatureValid = hasDrawnContent && canvasHasContent;
+        console.log(
+          "✍️ Signature Check (DRAW): hasDrawnContent =",
+          hasDrawnContent,
+          "canvasHasContent =",
+          canvasHasContent,
+          "Valid =",
+          isSignatureValid
+        );
       } else {
         isSignatureValid = compressedUploadBase64.trim() !== "";
+        console.log(
+          "✍️ Signature Check (UPLOAD): compressedSize =",
+          compressedUploadBase64.length,
+          "Valid =",
+          isSignatureValid
+        );
       }
+
+      console.log(
+        "🔘 FINAL STATE: Code Valid =",
+        isCodeValid,
+        "Sig Valid =",
+        isSignatureValid,
+        "Should Enable =",
+        isCodeValid && isSignatureValid
+      );
 
       if (isCodeValid && isSignatureValid) {
         signButton.disabled = false;
         signButton.style.backgroundColor = "#0078d4";
         signButton.style.cursor = "pointer";
         signButton.style.opacity = "1";
+        console.log("✅ Button ENABLED");
       } else {
         signButton.disabled = true;
         signButton.style.backgroundColor = "#c8c6c4";
         signButton.style.cursor = "not-allowed";
         signButton.style.opacity = "0.6";
+        console.log("❌ Button DISABLED");
       }
     };
 
@@ -782,6 +822,7 @@ export async function promptAndGenerateSecureAudit(
       activeBtn.style.color = "#0078d4";
       activeBtn.style.borderBottom = "3px solid #0078d4";
 
+      console.log("Tab switched to:", mode);
       updateButtonState();
     };
 
@@ -863,7 +904,9 @@ export async function promptAndGenerateSecureAudit(
 
             if (vResult.success && vResult.itemId) {
               storedVerificationItemId = vResult.itemId;
+              console.log("✅ OTP dispatched successfully");
             } else {
+              console.error("❌ OTP dispatch failed:", vResult.error);
               alert(
                 "Failed to dispatch verification code. Please try again."
               );
@@ -871,9 +914,7 @@ export async function promptAndGenerateSecureAudit(
           }
         } catch (err) {
           console.error("Failed to send code:", err);
-          alert(
-            "Failed to send verification code. Please try again."
-          );
+          alert("Failed to send verification code. Please try again.");
         } finally {
           startCooldownTimer();
         }
@@ -884,10 +925,13 @@ export async function promptAndGenerateSecureAudit(
       };
 
       vInputRef.oninput = (): void => {
+        console.log("🔐 TFA input changed, checking button state");
         updateButtonState();
       };
 
       void triggerSendCode();
+    } else if (requireTFA && !context.channel) {
+      console.warn("⚠️ TFA required but no channel provided");
     }
 
     // -----------------------------------------------------------------
@@ -949,6 +993,7 @@ export async function promptAndGenerateSecureAudit(
       const pos = getPos(e);
       ctx.lineTo(pos.x, pos.y);
       ctx.stroke();
+      console.log("✏️ Drawing, updating button state");
       updateButtonState();
       e.preventDefault();
     };
@@ -956,6 +1001,7 @@ export async function promptAndGenerateSecureAudit(
     /** Ends the current drawing stroke. */
     const stopDraw = (): void => {
       isDrawing = false;
+      console.log("✋ Drawing stopped, updating button state");
       updateButtonState();
     };
 
@@ -972,6 +1018,7 @@ export async function promptAndGenerateSecureAudit(
         ctx.fillStyle = "#ffffff";
         ctx.fillRect(0, 0, canvas.width, canvas.height);
         hasDrawnContent = false;
+        console.log("🧹 Canvas cleared, updating button state");
         updateButtonState();
       }
     };
@@ -1031,6 +1078,7 @@ export async function promptAndGenerateSecureAudit(
                   tempCanvas.toDataURL("image/png");
                 uploadPreview.src = compressedUploadBase64;
                 uploadPreview.style.display = "block";
+                console.log("📤 File uploaded, updating button state");
                 updateButtonState();
               }
             };
