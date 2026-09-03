@@ -31,10 +31,24 @@ elseif ($bumpInput -eq "3") { $BumpType = "major" }
 elseif ($bumpInput -eq "0") { $BumpType = "none" }
 
 # ------------------------------------------------------------------------------
+# Helper: Run external process and enforce exit-code safety
+# ------------------------------------------------------------------------------
+function Invoke-ExternalCommand {
+    param (
+        [scriptblock]$Command,
+        [string]$ErrorMessage
+    )
+    & $Command
+    if ($LASTEXITCODE -ne 0) {
+        throw $ErrorMessage
+    }
+}
+
+# ------------------------------------------------------------------------------
 # 2. Build Pipeline
 # ------------------------------------------------------------------------------
 Write-Host "`n==> 1. Running TypeScript Compilation..." -ForegroundColor Cyan
-npm run build
+Invoke-ExternalCommand -Command { npm run build } -ErrorMessage "TypeScript compilation failed."
 
 # ------------------------------------------------------------------------------
 # 3. Version Handling
@@ -44,7 +58,12 @@ if ($BumpType -eq "none") {
     Write-Host "`n==> 2. Keeping existing version ($newVersion)..." -ForegroundColor Yellow
 } else {
     Write-Host "`n==> 2. Bumping Package Version ($BumpType)..." -ForegroundColor Cyan
-    $newVersion = (npm version $BumpType --no-git-tag-version).Trim()
+    # Run npm version
+    $newVersionRaw = & npm version $BumpType --no-git-tag-version
+    if ($LASTEXITCODE -ne 0) {
+         throw "Failed to bump package version."
+    }
+    $newVersion = $newVersionRaw.Trim()
     Write-Host "New Version: $newVersion" -ForegroundColor Green
 }
 
@@ -52,7 +71,7 @@ if ($BumpType -eq "none") {
 # 4. Git Synchronization
 # ------------------------------------------------------------------------------
 Write-Host "`n==> 3. Checking Git Working Tree..." -ForegroundColor Cyan
-git add .
+Invoke-ExternalCommand -Command { git add . } -ErrorMessage "Failed to stage git files."
 
 # Check if there are staged changes to commit
 $gitStatus = git status --porcelain
@@ -67,7 +86,7 @@ if ($gitStatus) {
     }
 
     $fullCommitMessage = "$CommitMessage ($newVersion)"
-    git commit -m $fullCommitMessage
+    Invoke-ExternalCommand -Command { git commit -m $fullCommitMessage } -ErrorMessage "Git commit failed."
     Write-Host "Committed changes: $fullCommitMessage" -ForegroundColor Green
 } else {
     Write-Host "No uncommitted file changes detected. Skipping commit step." -ForegroundColor Yellow
@@ -75,7 +94,7 @@ if ($gitStatus) {
 
 Write-Host "Pushing to remote repository (main)..." -ForegroundColor Gray
 try {
-    git push origin main
+    Invoke-ExternalCommand -Command { git push origin main } -ErrorMessage "Git push failed."
     Write-Host "GitHub synchronization complete!" -ForegroundColor Green
 } catch {
     Write-Host "`n[ERROR] Git push failed. Please check your internet connection or git branch status." -ForegroundColor Red
@@ -90,11 +109,12 @@ Write-Host "`n==> 4. NPM Registry Publication..." -ForegroundColor Cyan
 $confirmPublish = Read-Host "Ready to publish $newVersion to NPM? [Y/n]"
 if ($confirmPublish -eq "" -or $confirmPublish.ToUpper() -eq "Y") {
     try {
-        npm publish --access public
+        Invoke-ExternalCommand -Command { npm publish --access public } -ErrorMessage "NPM publish failed."
         Write-Host "Successfully published $newVersion to NPM!" -ForegroundColor Green
     } catch {
-        Write-Host "`n[ERROR] NPM publish failed (e.g., authentication timeout or network error)." -ForegroundColor Red
-        Write-Host "You can fix the issue (e.g., run 'npm login') and rerun .\publish.ps1 using option [0] to retry publishing $newVersion." -ForegroundColor Yellow
+        Write-Host "`n[ERROR] NPM publish failed." -ForegroundColor Red
+        Write-Host "Verify your login status by running 'npm whoami' (must be logged in as 'bdking71')." -ForegroundColor Yellow
+        Write-Host "To fix, run 'npm login' and then rerun .\publish.ps1 using option [0] to retry." -ForegroundColor Yellow
         exit 1
     }
 } else {
