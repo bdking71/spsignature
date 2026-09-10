@@ -1633,7 +1633,8 @@ function isCanvasEmpty(
 export async function verifySecureAuditRecord(
   auditRecord: SharePointAuditRecord,
   signer: string,
-  payload: Record<string, unknown>
+  payload: Record<string, unknown>,
+  itemID?: number
 ): Promise<boolean> {
   try {
     if (!auditRecord || !signer || !payload) {
@@ -1649,12 +1650,13 @@ export async function verifySecureAuditRecord(
     const normalizedHash = auditRecord.signatureHash.trim();
 
     validateJsonSerializable(payload);
-    const deepSortedPayload = deepSortPayload(payload) as Record<string, unknown>;
+    const deepSortedPayload = deepSortPayload(payload) as Record<string, unknown>;  // ← CAST THIS
 
     const auditEnvelope: AuditEnvelopeRecord = {
       payload: deepSortedPayload,
       signer: normalizedSigner,
       timestamp: normalizedTimestamp,
+      itemID: itemID,  // ← Already added
     };
 
     const auditEnvelopeJson: string = JSON.stringify(auditEnvelope);

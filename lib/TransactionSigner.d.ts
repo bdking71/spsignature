@@ -150,4 +150,4 @@ export declare function getReportableSignature(compressedSignatureData: string):
  * }
  * ```
  */
-export declare function verifySecureAuditRecord(auditRecord: SharePointAuditRecord, signer: string, payload: Record<string, unknown>): Promise<boolean>;
+export declare function verifySecureAuditRecord(auditRecord: SharePointAuditRecord, signer: string, payload: Record<string, unknown>, itemID?: number): Promise<boolean>;
