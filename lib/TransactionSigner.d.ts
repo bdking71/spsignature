@@ -63,16 +63,20 @@ export interface AuditEnvelopeRecord {
     payload: Record<string, unknown>;
     signer: string;
     timestamp: string;
+    itemID?: number;
 }
 /**
  * Opens a full-screen modal dialog that walks the user through:
  *
- * 1. (Optional) Two-factor passcode verification
+ * 1. (Optional) Two-factor passcode verification (user-initiated)
  * 2. Providing a digital signature (cached / drawn / uploaded)
  * 3. Generating a tamper-evident SHA-256 audit record
  *
  * The returned promise resolves with a `SharePointAuditRecord` on
  * success or `undefined` if the user cancels.
+ *
+ * **Note:** Only one modal can be active at a time. Attempting to open
+ * a second modal while one is active will return `undefined` immediately.
  *
  * @param context        - Signer metadata and SPFx context.
  * @param modalTitle     - Title shown in the modal header.
@@ -80,7 +84,7 @@ export interface AuditEnvelopeRecord {
  *                         signature area.
  * @returns A promise that resolves to the audit record or `undefined`.
  *
- * @throws {Error} If `context.spContext` is falsy.
+ * @throws {Error} If `context.spContext` is falsy or signer is invalid.
  *
  * @example
  * ```ts
@@ -92,6 +96,10 @@ export interface AuditEnvelopeRecord {
  *   channel: "email",
  *   requireTFA: true,  // Enable TFA
  * });
+ *
+ * if (record) {
+ *   console.log("Signed successfully!");
+ * }
  * ```
  */
 export declare function promptAndGenerateSecureAudit(context: SignerContext, modalTitle?: string, warningMessage?: string): Promise<SharePointAuditRecord | undefined>;
@@ -115,13 +123,16 @@ export declare function getReportableSignature(compressedSignatureData: string):
  * record has not been tampered with, without needing access to the
  * original signature image.
  *
- * **Note:** Only top-level payload keys are sorted. If your payload
- * contains nested objects whose key order may vary, consider using a
- * deep-sort utility before calling this function.
+ * **Deep Sorting:** Payload is deep-sorted to ensure nested objects
+ * maintain consistent key ordering. All payload values must be
+ * JSON-serializable (no functions, symbols, undefined at top level).
+ *
+ * **Timestamp Precision:** Timestamps are stored at second precision
+ * to avoid hash mismatches from millisecond variations.
  *
  * @param auditRecord - The SharePointAuditRecord returned from `promptAndGenerateSecureAudit`.
  * @param signer      - The signer's email address or display name (must match original signer).
- * @param payload     - The original payload object that was signed.
+ * @param payload     - The original payload object that was signed (must be JSON-serializable).
  * @returns `true` if the signature hash is valid and authentic.
  *
  * @example
