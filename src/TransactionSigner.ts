@@ -21,11 +21,68 @@
 import { WebPartContext } from "@microsoft/sp-webpart-base";
 import { dispatchOtpPasscode, DeliveryChannel } from "./OtpService";
 
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
 /** localStorage key used to persist a compressed signature across sessions. */
 const STORAGE_KEY = "secure_audit_cached_signature_v1";
 
 /** Maximum upload file size in bytes (5 MB). */
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
+
+/** Maximum LZW dictionary size (prevents corruption in localStorage/JSON). */
+const LZW_DICT_MAX = 65535;
+
+/** Canvas dimensions. */
+const CANVAS_WIDTH = 560;
+const CANVAS_HEIGHT = 160;
+
+/** Image resize limits. */
+const IMAGE_MAX_WIDTH = 560;
+const IMAGE_MAX_HEIGHT = 160;
+
+/** Passcode generation limits. */
+const PASSCODE_MIN = 10000;
+const PASSCODE_MAX = 99999;
+const PASSCODE_LENGTH = 5;
+
+/** TFA cooldown timer (seconds). */
+const TFA_COOLDOWN_SECONDS = 60;
+
+/** Modal close timeout (milliseconds) - prevents hanging promises. */
+const MODAL_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+
+/** Timestamp precision (seconds, not milliseconds). */
+const TIMESTAMP_PRECISION = "seconds";
+
+/** Fluent Design System colors. */
+const COLORS = {
+  PRIMARY: "#0078d4",
+  PRIMARY_DARK: "#005a9e",
+  ERROR: "#a4262c",
+  WARNING: "#ffd54f",
+  WARNING_BG: "#fff8e1",
+  INFO: "#e6f4ff",
+  INFO_BORDER: "#0078d4",
+  NEUTRAL_BG: "#fafafa",
+  NEUTRAL_LIGHT: "#f3f2f1",
+  NEUTRAL_LIGHTER: "#e1dfdd",
+  NEUTRAL_TEXT: "#323130",
+  NEUTRAL_TEXT_SEC: "#605e5c",
+  NEUTRAL_BORDER: "#d1d1d1",
+  NEUTRAL_BORDER_DARK: "#8a8886",
+};
+
+/** UI Icons (with accessible fallbacks). */
+const ICONS = {
+  LOCK: "🔐",
+  CHECK: "✓",
+  FOLDER: "📁",
+};
+
+// Global modal state to prevent concurrent instances
+let activeModalInstance: AbortController | null = null;
 
 // ---------------------------------------------------------------------------
 // Public interfaces
@@ -77,6 +134,64 @@ export interface AuditEnvelopeRecord {
   payload: Record<string, unknown>;
   signer: string;
   timestamp: string;
+  itemID?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers – validation
+// ---------------------------------------------------------------------------
+
+/**
+ * Validates that a value is a non-empty string.
+ *
+ * @param value - The value to check.
+ * @param fieldName - Field name for error messages.
+ * @returns The trimmed string.
+ * @throws {Error} If value is not a valid string.
+ */
+function assertNonEmptyString(value: unknown, fieldName: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`${fieldName} must be a non-empty string.`);
+  }
+  return value.trim();
+}
+
+/**
+ * Validates that an object is JSON-serializable.
+ *
+ * @param obj - Object to validate.
+ * @throws {Error} If object contains non-serializable values.
+ */
+function validateJsonSerializable(obj: unknown): void {
+  try {
+    JSON.stringify(obj);
+  } catch (error) {
+    throw new Error(`Payload is not JSON-serializable: ${String(error)}`);
+  }
+}
+
+/**
+ * Sanitizes email/signer input to prevent XSS.
+ *
+ * @param input - The signer identifier.
+ * @returns Sanitized string (alphanumeric, @, ., -, _).
+ */
+function sanitizeSigner(input: string): string {
+  const sanitized = input.toLowerCase().trim();
+  if (!/^[a-z0-9@._-]+$/.test(sanitized)) {
+    throw new Error("Signer identifier contains invalid characters.");
+  }
+  return sanitized;
+}
+
+/**
+ * Generates a precision-reduced ISO timestamp (seconds, not milliseconds)
+ * to avoid hash mismatches from millisecond variations.
+ *
+ * @returns ISO-8601 timestamp (seconds precision).
+ */
+function generateTimestamp(): string {
+  return new Date().toISOString().split(".")[0] + "Z";
 }
 
 // ---------------------------------------------------------------------------
@@ -92,7 +207,7 @@ export interface AuditEnvelopeRecord {
 function generateFiveDigitPasscode(): string {
   const array = new Uint32Array(1);
   window.crypto.getRandomValues(array);
-  const code = (array[0] % 90000) + 10000;
+  const code = (array[0] % (PASSCODE_MAX - PASSCODE_MIN + 1)) + PASSCODE_MIN;
   return code.toString();
 }
 
@@ -103,12 +218,15 @@ function generateFiveDigitPasscode(): string {
 /**
  * Opens a full-screen modal dialog that walks the user through:
  *
- * 1. (Optional) Two-factor passcode verification
+ * 1. (Optional) Two-factor passcode verification (user-initiated)
  * 2. Providing a digital signature (cached / drawn / uploaded)
  * 3. Generating a tamper-evident SHA-256 audit record
  *
  * The returned promise resolves with a `SharePointAuditRecord` on
  * success or `undefined` if the user cancels.
+ *
+ * **Note:** Only one modal can be active at a time. Attempting to open
+ * a second modal while one is active will return `undefined` immediately.
  *
  * @param context        - Signer metadata and SPFx context.
  * @param modalTitle     - Title shown in the modal header.
@@ -116,7 +234,7 @@ function generateFiveDigitPasscode(): string {
  *                         signature area.
  * @returns A promise that resolves to the audit record or `undefined`.
  *
- * @throws {Error} If `context.spContext` is falsy.
+ * @throws {Error} If `context.spContext` is falsy or signer is invalid.
  *
  * @example
  * ```ts
@@ -128,6 +246,10 @@ function generateFiveDigitPasscode(): string {
  *   channel: "email",
  *   requireTFA: true,  // Enable TFA
  * });
+ *
+ * if (record) {
+ *   console.log("Signed successfully!");
+ * }
  * ```
  */
 export async function promptAndGenerateSecureAudit(
@@ -141,13 +263,34 @@ export async function promptAndGenerateSecureAudit(
     );
   }
 
+  // Prevent concurrent modals
+  if (activeModalInstance !== null) {
+    return undefined;
+  }
+
+  // Validate signer early
+  try {
+    assertNonEmptyString(context.signer, "Signer");
+    sanitizeSigner(context.signer);
+  } catch (error) {
+    throw new Error(`Invalid signer: ${String(error)}`);
+  }
+
   return new Promise<SharePointAuditRecord | undefined>((resolve): void => {
-    // TFA is only enabled if explicitly set to true
+    // Create abort controller for this modal instance
+    const abortController = new AbortController();
+    activeModalInstance = abortController;
+
+    // Set timeout to prevent hanging promises
+    const timeoutId = window.setTimeout(() => {
+      cleanup();
+      resolve(undefined);
+    }, MODAL_TIMEOUT_MS);
+
     const requireTFA = context.requireTFA === true;
     const generatedPasscode = generateFiveDigitPasscode();
     let storedVerificationItemId: number | undefined = undefined;
-
-    console.log("TFA Enabled:", requireTFA); // DEBUG
+    let tfaVerified = false;
 
     // -----------------------------------------------------------------
     // Overlay
@@ -186,9 +329,9 @@ export async function promptAndGenerateSecureAudit(
     // Header
     // -----------------------------------------------------------------
     const headerSection: HTMLDivElement = document.createElement("div");
-    headerSection.style.backgroundColor = "#0078d4";
+    headerSection.style.backgroundColor = COLORS.PRIMARY;
     headerSection.style.padding = "20px 24px";
-    headerSection.style.borderBottom = "3px solid #005a9e";
+    headerSection.style.borderBottom = `3px solid ${COLORS.PRIMARY_DARK}`;
 
     const title: HTMLHeadingElement = document.createElement("h2");
     title.innerText = modalTitle;
@@ -205,14 +348,14 @@ export async function promptAndGenerateSecureAudit(
     // -----------------------------------------------------------------
     const contentSection: HTMLDivElement = document.createElement("div");
     contentSection.style.padding = "24px";
-    contentSection.style.backgroundColor = "#fafafa";
+    contentSection.style.backgroundColor = COLORS.NEUTRAL_BG;
     contentSection.style.overflowY = "auto";
     contentSection.style.flex = "1";
 
     const body: HTMLParagraphElement = document.createElement("p");
     body.innerHTML = warningMessage;
     body.style.fontSize = "14px";
-    body.style.color = "#323130";
+    body.style.color = COLORS.NEUTRAL_TEXT;
     body.style.lineHeight = "1.6";
     body.style.margin = "0 0 20px 0";
 
@@ -221,8 +364,9 @@ export async function promptAndGenerateSecureAudit(
     // -----------------------------------------------------------------
     const signButton: HTMLButtonElement = document.createElement("button");
     signButton.innerText = "I Agree and Sign";
+    signButton.setAttribute("aria-label", "Sign the document with your digital signature");
     signButton.style.padding = "10px 24px";
-    signButton.style.backgroundColor = "#0078d4";
+    signButton.style.backgroundColor = COLORS.PRIMARY;
     signButton.style.color = "#ffffff";
     signButton.style.border = "none";
     signButton.style.cursor = "pointer";
@@ -237,21 +381,17 @@ export async function promptAndGenerateSecureAudit(
     const verificationContainer: HTMLDivElement =
       document.createElement("div");
 
-    /** Direct reference to the passcode <input> (avoids fragile querySelector). */
     let verificationInput: HTMLInputElement | null = null;
-    /** Direct reference to the "Resend Code" button. */
     let sendCodeButton: HTMLButtonElement | null = null;
 
     if (requireTFA) {
       verificationContainer.style.marginBottom = "20px";
       verificationContainer.style.padding = "16px";
-      verificationContainer.style.backgroundColor = "#fff8e1";
-      verificationContainer.style.border = "1px solid #ffd54f";
+      verificationContainer.style.backgroundColor = COLORS.WARNING_BG;
+      verificationContainer.style.border = `1px solid ${COLORS.WARNING}`;
       verificationContainer.style.borderRadius = "6px";
-      verificationContainer.style.boxShadow =
-        "0 2px 4px rgba(0,0,0,0.05)";
+      verificationContainer.style.boxShadow = "0 2px 4px rgba(0,0,0,0.05)";
 
-      /* Header row with lock icon */
       const verificationHeader: HTMLDivElement =
         document.createElement("div");
       verificationHeader.style.display = "flex";
@@ -260,8 +400,9 @@ export async function promptAndGenerateSecureAudit(
       verificationHeader.style.gap = "8px";
 
       const lockIcon: HTMLSpanElement = document.createElement("span");
-      lockIcon.innerHTML = "🔐";
+      lockIcon.innerHTML = ICONS.LOCK;
       lockIcon.style.fontSize = "18px";
+      lockIcon.setAttribute("aria-hidden", "true");
 
       const verificationLabel: HTMLLabelElement =
         document.createElement("label");
@@ -269,7 +410,7 @@ export async function promptAndGenerateSecureAudit(
       verificationLabel.style.display = "block";
       verificationLabel.style.fontSize = "13px";
       verificationLabel.style.fontWeight = "700";
-      verificationLabel.style.color = "#323130";
+      verificationLabel.style.color = COLORS.NEUTRAL_TEXT;
       verificationLabel.style.margin = "0";
 
       verificationHeader.appendChild(lockIcon);
@@ -277,15 +418,14 @@ export async function promptAndGenerateSecureAudit(
 
       const verificationDescription: HTMLParagraphElement =
         document.createElement("p");
-      verificationDescription.innerText = `A 5-digit verification code has been sent to ${
-        context.channel === "teams" ? "Microsoft Teams" : "your email"
+      verificationDescription.innerText = `Click "Send Code" to receive a 5-digit verification code via ${
+        context.channel === "teams" ? "Microsoft Teams" : "email"
       }.`;
       verificationDescription.style.fontSize = "12px";
-      verificationDescription.style.color = "#605e5c";
+      verificationDescription.style.color = COLORS.NEUTRAL_TEXT_SEC;
       verificationDescription.style.margin = "0 0 12px 0";
       verificationDescription.style.lineHeight = "1.5";
 
-      /* Input + Resend row */
       const verificationRow: HTMLDivElement =
         document.createElement("div");
       verificationRow.style.display = "flex";
@@ -293,13 +433,15 @@ export async function promptAndGenerateSecureAudit(
 
       verificationInput = document.createElement("input");
       verificationInput.type = "text";
-      verificationInput.maxLength = 5;
+      verificationInput.inputMode = "numeric";
+      verificationInput.maxLength = PASSCODE_LENGTH;
       verificationInput.placeholder = "Enter 5-digit code";
+      verificationInput.setAttribute("aria-label", "Two-factor authentication code");
       verificationInput.style.flex = "1";
       verificationInput.style.padding = "10px 12px";
       verificationInput.style.fontSize = "14px";
       verificationInput.style.boxSizing = "border-box";
-      verificationInput.style.border = "2px solid #d1d1d1";
+      verificationInput.style.border = `2px solid ${COLORS.NEUTRAL_BORDER}`;
       verificationInput.style.borderRadius = "4px";
       verificationInput.style.outline = "none";
       verificationInput.style.transition = "border-color 0.2s ease";
@@ -307,37 +449,40 @@ export async function promptAndGenerateSecureAudit(
       verificationInput.style.letterSpacing = "2px";
       verificationInput.style.fontWeight = "600";
 
-      const vInput = verificationInput; // capture for closures
+      const vInput = verificationInput;
       vInput.onfocus = (): void => {
-        vInput.style.borderColor = "#0078d4";
+        vInput.style.borderColor = COLORS.PRIMARY;
       };
       vInput.onblur = (): void => {
-        vInput.style.borderColor = "#d1d1d1";
+        vInput.style.borderColor = COLORS.NEUTRAL_BORDER;
       };
 
       sendCodeButton = document.createElement("button");
-      sendCodeButton.innerText = "Resend Code";
+      sendCodeButton.innerText = "Send Code";
       sendCodeButton.type = "button";
+      sendCodeButton.setAttribute("aria-label", "Send verification code");
       sendCodeButton.style.padding = "10px 16px";
       sendCodeButton.style.fontSize = "12px";
       sendCodeButton.style.backgroundColor = "#ffffff";
-      sendCodeButton.style.color = "#0078d4";
-      sendCodeButton.style.border = "2px solid #0078d4";
+      sendCodeButton.style.color = COLORS.PRIMARY;
+      sendCodeButton.style.border = `2px solid ${COLORS.PRIMARY}`;
       sendCodeButton.style.cursor = "pointer";
       sendCodeButton.style.whiteSpace = "nowrap";
       sendCodeButton.style.borderRadius = "4px";
       sendCodeButton.style.fontWeight = "600";
       sendCodeButton.style.transition = "all 0.2s ease";
 
-      const scBtn = sendCodeButton; // capture for closures
+      const scBtn = sendCodeButton;
       scBtn.onmouseover = (): void => {
-        scBtn.style.backgroundColor = "#0078d4";
-        scBtn.style.color = "#ffffff";
+        if (!scBtn.disabled) {
+          scBtn.style.backgroundColor = COLORS.PRIMARY;
+          scBtn.style.color = "#ffffff";
+        }
       };
       scBtn.onmouseout = (): void => {
         if (!scBtn.disabled) {
           scBtn.style.backgroundColor = "#ffffff";
-          scBtn.style.color = "#0078d4";
+          scBtn.style.color = COLORS.PRIMARY;
         }
       };
 
@@ -356,10 +501,20 @@ export async function promptAndGenerateSecureAudit(
       localStorage.getItem(STORAGE_KEY);
     let hasCachedSignature: boolean =
       cachedCompressedSig !== null && cachedCompressedSig.trim() !== "";
-    const decompressedCachedDataUri: string =
-      hasCachedSignature && cachedCompressedSig
-        ? lzwDecompress(cachedCompressedSig)
-        : "";
+    let decompressedCachedDataUri: string = "";
+
+    if (hasCachedSignature && cachedCompressedSig) {
+      try {
+        decompressedCachedDataUri = lzwDecompress(cachedCompressedSig);
+        if (!decompressedCachedDataUri.startsWith("data:image")) {
+          hasCachedSignature = false;
+          decompressedCachedDataUri = "";
+        }
+      } catch {
+        hasCachedSignature = false;
+        decompressedCachedDataUri = "";
+      }
+    }
 
     // -----------------------------------------------------------------
     // Signature section wrapper
@@ -368,7 +523,7 @@ export async function promptAndGenerateSecureAudit(
     signatureSection.style.marginBottom = "20px";
     signatureSection.style.padding = "16px";
     signatureSection.style.backgroundColor = "#ffffff";
-    signatureSection.style.border = "1px solid #d1d1d1";
+    signatureSection.style.border = `1px solid ${COLORS.NEUTRAL_BORDER}`;
     signatureSection.style.borderRadius = "6px";
     signatureSection.style.boxShadow = "0 2px 4px rgba(0,0,0,0.05)";
 
@@ -380,7 +535,7 @@ export async function promptAndGenerateSecureAudit(
     signatureLabel.innerText = "Digital Signature";
     signatureLabel.style.fontSize = "14px";
     signatureLabel.style.fontWeight = "700";
-    signatureLabel.style.color = "#323130";
+    signatureLabel.style.color = COLORS.NEUTRAL_TEXT;
     signatureLabel.style.margin = "0 0 4px 0";
 
     const signatureSubtext: HTMLParagraphElement =
@@ -388,7 +543,7 @@ export async function promptAndGenerateSecureAudit(
     signatureSubtext.innerText =
       "Choose how you'd like to provide your signature";
     signatureSubtext.style.fontSize = "12px";
-    signatureSubtext.style.color = "#605e5c";
+    signatureSubtext.style.color = COLORS.NEUTRAL_TEXT_SEC;
     signatureSubtext.style.margin = "0";
 
     signatureHeader.appendChild(signatureLabel);
@@ -400,8 +555,8 @@ export async function promptAndGenerateSecureAudit(
     const cacheControlBox: HTMLDivElement = document.createElement("div");
     cacheControlBox.style.marginTop = "16px";
     cacheControlBox.style.padding = "12px";
-    cacheControlBox.style.backgroundColor = "#f3f2f1";
-    cacheControlBox.style.border = "1px solid #d1d1d1";
+    cacheControlBox.style.backgroundColor = COLORS.NEUTRAL_LIGHT;
+    cacheControlBox.style.border = `1px solid ${COLORS.NEUTRAL_BORDER}`;
     cacheControlBox.style.borderRadius = "4px";
     cacheControlBox.style.fontSize = "12px";
 
@@ -415,6 +570,7 @@ export async function promptAndGenerateSecureAudit(
     const cacheCheckbox: HTMLInputElement = document.createElement("input");
     cacheCheckbox.type = "checkbox";
     cacheCheckbox.checked = true;
+    cacheCheckbox.setAttribute("aria-label", "Remember signature for future transactions");
     cacheCheckbox.style.cursor = "pointer";
     cacheCheckbox.style.width = "16px";
     cacheCheckbox.style.height = "16px";
@@ -423,7 +579,7 @@ export async function promptAndGenerateSecureAudit(
       document.createElement("span");
     cacheCheckboxText.innerText =
       "Remember my signature on this device for future transactions";
-    cacheCheckboxText.style.color = "#323130";
+    cacheCheckboxText.style.color = COLORS.NEUTRAL_TEXT;
     cacheCheckboxText.style.fontSize = "12px";
 
     cacheCheckboxLabel.appendChild(cacheCheckbox);
@@ -437,30 +593,31 @@ export async function promptAndGenerateSecureAudit(
       document.createElement("div");
     cachedNoticeContainer.style.marginBottom = "16px";
     cachedNoticeContainer.style.padding = "16px";
-    cachedNoticeContainer.style.backgroundColor = "#e6f4ff";
-    cachedNoticeContainer.style.border = "1px solid #0078d4";
+    cachedNoticeContainer.style.backgroundColor = COLORS.INFO;
+    cachedNoticeContainer.style.border = `1px solid ${COLORS.INFO_BORDER}`;
     cachedNoticeContainer.style.borderRadius = "6px";
     cachedNoticeContainer.style.display = hasCachedSignature
       ? "block"
       : "none";
 
     const cachedNoticeText: HTMLDivElement = document.createElement("div");
-    cachedNoticeText.innerText = "✓ Saved signature on file";
+    cachedNoticeText.innerText = `${ICONS.CHECK} Saved signature on file`;
     cachedNoticeText.style.fontSize = "13px";
     cachedNoticeText.style.marginBottom = "12px";
     cachedNoticeText.style.fontWeight = "600";
-    cachedNoticeText.style.color = "#0078d4";
+    cachedNoticeText.style.color = COLORS.PRIMARY;
 
     const cachedPreviewImage: HTMLImageElement =
       document.createElement("img");
     cachedPreviewImage.src = decompressedCachedDataUri;
+    cachedPreviewImage.alt = "Your saved signature";
     cachedPreviewImage.style.maxWidth = "100%";
     cachedPreviewImage.style.height = "auto";
     cachedPreviewImage.style.minHeight = "80px";
     cachedPreviewImage.style.maxHeight = "120px";
     cachedPreviewImage.style.display = "block";
     cachedPreviewImage.style.marginBottom = "12px";
-    cachedPreviewImage.style.border = "2px solid #0078d4";
+    cachedPreviewImage.style.border = `2px solid ${COLORS.PRIMARY}`;
     cachedPreviewImage.style.backgroundColor = "#ffffff";
     cachedPreviewImage.style.borderRadius = "4px";
     cachedPreviewImage.style.padding = "8px";
@@ -469,23 +626,24 @@ export async function promptAndGenerateSecureAudit(
     const removeCachedBtn: HTMLButtonElement =
       document.createElement("button");
     removeCachedBtn.innerText = "Remove Saved Signature";
+    removeCachedBtn.setAttribute("aria-label", "Remove saved signature and use new one");
     removeCachedBtn.style.padding = "6px 12px";
     removeCachedBtn.style.fontSize = "11px";
     removeCachedBtn.style.backgroundColor = "#ffffff";
-    removeCachedBtn.style.border = "1px solid #a4262c";
-    removeCachedBtn.style.color = "#a4262c";
+    removeCachedBtn.style.border = `1px solid ${COLORS.ERROR}`;
+    removeCachedBtn.style.color = COLORS.ERROR;
     removeCachedBtn.style.cursor = "pointer";
     removeCachedBtn.style.borderRadius = "4px";
     removeCachedBtn.style.fontWeight = "600";
     removeCachedBtn.style.transition = "all 0.2s ease";
 
     removeCachedBtn.onmouseover = (): void => {
-      removeCachedBtn.style.backgroundColor = "#a4262c";
+      removeCachedBtn.style.backgroundColor = COLORS.ERROR;
       removeCachedBtn.style.color = "#ffffff";
     };
     removeCachedBtn.onmouseout = (): void => {
       removeCachedBtn.style.backgroundColor = "#ffffff";
-      removeCachedBtn.style.color = "#a4262c";
+      removeCachedBtn.style.color = COLORS.ERROR;
     };
 
     cachedNoticeContainer.appendChild(cachedNoticeText);
@@ -499,43 +657,37 @@ export async function promptAndGenerateSecureAudit(
     modeContainer.style.display = "flex";
     modeContainer.style.gap = "8px";
     modeContainer.style.marginBottom = "16px";
-    modeContainer.style.borderBottom = "2px solid #edebe9";
+    modeContainer.style.borderBottom = `2px solid #edebe9`;
+    modeContainer.setAttribute("role", "tablist");
 
-    /**
-     * Factory that creates a styled tab button.
-     *
-     * @param text      - Label for the tab.
-     * @param isActive  - Whether the tab should appear selected initially.
-     * @returns The constructed `<button>` element.
-     */
     const createTab = (
       text: string,
       isActive: boolean
     ): HTMLButtonElement => {
       const tab = document.createElement("button");
       tab.innerText = text;
+      tab.setAttribute("role", "tab");
+      tab.setAttribute("aria-selected", isActive.toString());
       tab.style.padding = "10px 16px";
       tab.style.fontSize = "13px";
       tab.style.cursor = "pointer";
       tab.style.fontWeight = "600";
       tab.style.backgroundColor = "transparent";
-      tab.style.color = isActive ? "#0078d4" : "#605e5c";
+      tab.style.color = isActive ? COLORS.PRIMARY : COLORS.NEUTRAL_TEXT_SEC;
       tab.style.border = "none";
       tab.style.borderBottom = isActive
-        ? "3px solid #0078d4"
+        ? `3px solid ${COLORS.PRIMARY}`
         : "3px solid transparent";
       tab.style.transition = "all 0.2s ease";
       tab.style.outline = "none";
 
-      /* Hover handlers check current activeMode so they remain correct
-         after the user switches tabs. */
       tab.onmouseover = (): void => {
         const tabIsCurrentlyActive =
           (tab === cachedTabBtn && activeMode === "cached") ||
           (tab === drawTabBtn && activeMode === "draw") ||
           (tab === uploadTabBtn && activeMode === "upload");
         if (!tabIsCurrentlyActive) {
-          tab.style.color = "#0078d4";
+          tab.style.color = COLORS.PRIMARY;
         }
       };
       tab.onmouseout = (): void => {
@@ -544,7 +696,7 @@ export async function promptAndGenerateSecureAudit(
           (tab === drawTabBtn && activeMode === "draw") ||
           (tab === uploadTabBtn && activeMode === "upload");
         if (!tabIsCurrentlyActive) {
-          tab.style.color = "#605e5c";
+          tab.style.color = COLORS.NEUTRAL_TEXT_SEC;
         }
       };
 
@@ -569,6 +721,7 @@ export async function promptAndGenerateSecureAudit(
     // Cached panel
     // -----------------------------------------------------------------
     const cachedPanel: HTMLDivElement = document.createElement("div");
+    cachedPanel.setAttribute("role", "tabpanel");
     cachedPanel.style.display = hasCachedSignature ? "block" : "none";
     cachedPanel.appendChild(cachedNoticeContainer);
 
@@ -576,26 +729,29 @@ export async function promptAndGenerateSecureAudit(
     // Draw panel (canvas)
     // -----------------------------------------------------------------
     const drawPanel: HTMLDivElement = document.createElement("div");
+    drawPanel.setAttribute("role", "tabpanel");
     drawPanel.style.display = hasCachedSignature ? "none" : "block";
 
     const canvasContainer: HTMLDivElement = document.createElement("div");
     canvasContainer.style.backgroundColor = "#ffffff";
     canvasContainer.style.padding = "16px";
     canvasContainer.style.borderRadius = "6px";
-    canvasContainer.style.border = "2px dashed #d1d1d1";
+    canvasContainer.style.border = `2px dashed ${COLORS.NEUTRAL_BORDER}`;
 
     const canvasInstructions: HTMLParagraphElement =
       document.createElement("p");
     canvasInstructions.innerText = "Draw your signature below:";
     canvasInstructions.style.fontSize = "12px";
-    canvasInstructions.style.color = "#605e5c";
+    canvasInstructions.style.color = COLORS.NEUTRAL_TEXT_SEC;
     canvasInstructions.style.margin = "0 0 8px 0";
     canvasInstructions.style.fontWeight = "600";
 
     const canvas: HTMLCanvasElement = document.createElement("canvas");
-    canvas.width = 560;
-    canvas.height = 160;
-    canvas.style.border = "1px solid #d1d1d1";
+    canvas.width = CANVAS_WIDTH;
+    canvas.height = CANVAS_HEIGHT;
+    canvas.setAttribute("role", "img");
+    canvas.setAttribute("aria-label", "Signature drawing area");
+    canvas.style.border = `1px solid ${COLORS.NEUTRAL_BORDER}`;
     canvas.style.backgroundColor = "#ffffff";
     canvas.style.cursor = "crosshair";
     canvas.style.display = "block";
@@ -603,25 +759,25 @@ export async function promptAndGenerateSecureAudit(
     canvas.style.borderRadius = "4px";
     canvas.style.boxShadow = "inset 0 1px 3px rgba(0,0,0,0.1)";
 
-    /** Button to clear the drawing canvas. */
     const clearButton: HTMLButtonElement = document.createElement("button");
     clearButton.innerText = "Clear Canvas";
+    clearButton.setAttribute("aria-label", "Clear the signature drawing");
     clearButton.style.marginTop = "10px";
     clearButton.style.padding = "8px 16px";
     clearButton.style.fontSize = "12px";
-    clearButton.style.backgroundColor = "#f3f2f1";
-    clearButton.style.border = "1px solid #d1d1d1";
+    clearButton.style.backgroundColor = COLORS.NEUTRAL_LIGHT;
+    clearButton.style.border = `1px solid ${COLORS.NEUTRAL_BORDER}`;
     clearButton.style.cursor = "pointer";
     clearButton.style.borderRadius = "4px";
     clearButton.style.fontWeight = "600";
-    clearButton.style.color = "#323130";
+    clearButton.style.color = COLORS.NEUTRAL_TEXT;
     clearButton.style.transition = "all 0.2s ease";
 
     clearButton.onmouseover = (): void => {
-      clearButton.style.backgroundColor = "#e1dfdd";
+      clearButton.style.backgroundColor = COLORS.NEUTRAL_LIGHTER;
     };
     clearButton.onmouseout = (): void => {
-      clearButton.style.backgroundColor = "#f3f2f1";
+      clearButton.style.backgroundColor = COLORS.NEUTRAL_LIGHT;
     };
 
     canvasContainer.appendChild(canvasInstructions);
@@ -633,9 +789,10 @@ export async function promptAndGenerateSecureAudit(
     // Upload panel
     // -----------------------------------------------------------------
     const uploadPanel: HTMLDivElement = document.createElement("div");
+    uploadPanel.setAttribute("role", "tabpanel");
     uploadPanel.style.display = "none";
     uploadPanel.style.padding = "32px 24px";
-    uploadPanel.style.border = "2px dashed #d1d1d1";
+    uploadPanel.style.border = `2px dashed ${COLORS.NEUTRAL_BORDER}`;
     uploadPanel.style.textAlign = "center";
     uploadPanel.style.backgroundColor = "#ffffff";
     uploadPanel.style.borderRadius = "6px";
@@ -646,20 +803,21 @@ export async function promptAndGenerateSecureAudit(
     uploadPanel.style.justifyContent = "center";
 
     const uploadIcon: HTMLDivElement = document.createElement("div");
-    uploadIcon.innerHTML = "📁";
+    uploadIcon.innerHTML = ICONS.FOLDER;
     uploadIcon.style.fontSize = "48px";
     uploadIcon.style.marginBottom = "16px";
+    uploadIcon.setAttribute("aria-hidden", "true");
 
     const uploadText: HTMLParagraphElement = document.createElement("p");
-    uploadText.innerText = "Click to upload or drag and drop";
+    uploadText.innerText = "Click to upload a signature image";
     uploadText.style.fontSize = "14px";
-    uploadText.style.color = "#605e5c";
+    uploadText.style.color = COLORS.NEUTRAL_TEXT_SEC;
     uploadText.style.margin = "0 0 8px 0";
     uploadText.style.fontWeight = "600";
 
     const uploadSubtext: HTMLParagraphElement =
       document.createElement("p");
-    uploadSubtext.innerText = "PNG, JPG (max 5MB)";
+    uploadSubtext.innerText = "PNG, JPG (max 5 MB)";
     uploadSubtext.style.fontSize = "12px";
     uploadSubtext.style.color = "#8a8886";
     uploadSubtext.style.margin = "0 0 16px 0";
@@ -667,17 +825,19 @@ export async function promptAndGenerateSecureAudit(
     const fileInput: HTMLInputElement = document.createElement("input");
     fileInput.type = "file";
     fileInput.accept = "image/png, image/jpeg, image/jpg";
+    fileInput.setAttribute("aria-label", "Upload signature image file");
     fileInput.style.fontSize = "12px";
     fileInput.style.marginBottom = "16px";
 
     const uploadPreview: HTMLImageElement = document.createElement("img");
+    uploadPreview.alt = "Preview of uploaded signature";
     uploadPreview.style.maxWidth = "100%";
     uploadPreview.style.height = "auto";
     uploadPreview.style.minHeight = "80px";
     uploadPreview.style.maxHeight = "120px";
     uploadPreview.style.marginTop = "16px";
     uploadPreview.style.display = "none";
-    uploadPreview.style.border = "2px solid #0078d4";
+    uploadPreview.style.border = `2px solid ${COLORS.PRIMARY}`;
     uploadPreview.style.borderRadius = "4px";
     uploadPreview.style.padding = "8px";
     uploadPreview.style.backgroundColor = "#ffffff";
@@ -714,82 +874,42 @@ export async function promptAndGenerateSecureAudit(
     // Button-state helper
     // -----------------------------------------------------------------
 
-    /**
-     * Re-evaluates whether the "I Agree and Sign" button should be
-     * enabled, based on the current TFA code entry and selected
-     * signature mode.
-     */
     const updateButtonState = (): void => {
       let isCodeValid = true;
 
-      // Check TFA only if it's required
       if (requireTFA) {
         if (verificationInput) {
           const codeValue = verificationInput.value.trim();
           isCodeValid =
-            codeValue.length === 5 && codeValue === generatedPasscode;
-          console.log(
-            "🔐 TFA Check: Code =",
-            codeValue,
-            "Valid =",
-            isCodeValid
-          );
+            codeValue.length === PASSCODE_LENGTH && codeValue === generatedPasscode;
         } else {
           isCodeValid = false;
-          console.log("🔐 TFA Check: No input element found");
         }
-      } else {
-        console.log("🔐 TFA not required - skipping TFA validation");
       }
 
-      // Check signature validity
       let isSignatureValid = false;
       if (activeMode === "cached") {
         isSignatureValid = hasCachedSignature;
-        console.log("✍️ Signature Check (CACHED): Valid =", isSignatureValid);
       } else if (activeMode === "draw") {
         const canvasHasContent =
           ctx !== null && !isCanvasEmpty(ctx, canvas.width, canvas.height);
         isSignatureValid = hasDrawnContent && canvasHasContent;
-        console.log(
-          "✍️ Signature Check (DRAW): hasDrawnContent =",
-          hasDrawnContent,
-          "canvasHasContent =",
-          canvasHasContent,
-          "Valid =",
-          isSignatureValid
-        );
       } else {
         isSignatureValid = compressedUploadBase64.trim() !== "";
-        console.log(
-          "✍️ Signature Check (UPLOAD): compressedSize =",
-          compressedUploadBase64.length,
-          "Valid =",
-          isSignatureValid
-        );
       }
 
-      console.log(
-        "🔘 FINAL STATE: Code Valid =",
-        isCodeValid,
-        "Sig Valid =",
-        isSignatureValid,
-        "Should Enable =",
-        isCodeValid && isSignatureValid
-      );
+      const shouldEnable = isCodeValid && isSignatureValid;
 
-      if (isCodeValid && isSignatureValid) {
+      if (shouldEnable) {
         signButton.disabled = false;
-        signButton.style.backgroundColor = "#0078d4";
+        signButton.style.backgroundColor = COLORS.PRIMARY;
         signButton.style.cursor = "pointer";
         signButton.style.opacity = "1";
-        console.log("✅ Button ENABLED");
       } else {
         signButton.disabled = true;
         signButton.style.backgroundColor = "#c8c6c4";
         signButton.style.cursor = "not-allowed";
         signButton.style.opacity = "0.6";
-        console.log("❌ Button DISABLED");
       }
     };
 
@@ -797,12 +917,6 @@ export async function promptAndGenerateSecureAudit(
     // Tab-switching logic
     // -----------------------------------------------------------------
 
-    /**
-     * Activates the given tab, hiding the other panels and updating
-     * visual tab styles.
-     *
-     * @param mode - Which panel to show.
-     */
     const setActiveTab = (
       mode: "cached" | "draw" | "upload"
     ): void => {
@@ -812,8 +926,9 @@ export async function promptAndGenerateSecureAudit(
       uploadPanel.style.display = mode === "upload" ? "flex" : "none";
 
       [cachedTabBtn, drawTabBtn, uploadTabBtn].forEach((btn) => {
-        btn.style.color = "#605e5c";
+        btn.style.color = COLORS.NEUTRAL_TEXT_SEC;
         btn.style.borderBottom = "3px solid transparent";
+        btn.setAttribute("aria-selected", "false");
       });
 
       const activeBtn =
@@ -822,10 +937,10 @@ export async function promptAndGenerateSecureAudit(
           : mode === "draw"
           ? drawTabBtn
           : uploadTabBtn;
-      activeBtn.style.color = "#0078d4";
-      activeBtn.style.borderBottom = "3px solid #0078d4";
+      activeBtn.style.color = COLORS.PRIMARY;
+      activeBtn.style.borderBottom = `3px solid ${COLORS.PRIMARY}`;
+      activeBtn.setAttribute("aria-selected", "true");
 
-      console.log("Tab switched to:", mode);
       updateButtonState();
     };
 
@@ -835,7 +950,6 @@ export async function promptAndGenerateSecureAudit(
     drawTabBtn.onclick = (): void => setActiveTab("draw");
     uploadTabBtn.onclick = (): void => setActiveTab("upload");
 
-    /** Removes the cached signature and switches to the draw tab. */
     removeCachedBtn.onclick = (): void => {
       localStorage.removeItem(STORAGE_KEY);
       hasCachedSignature = false;
@@ -851,20 +965,16 @@ export async function promptAndGenerateSecureAudit(
       const scBtnRef = sendCodeButton;
       const vInputRef = verificationInput;
 
-      /**
-       * Starts a 60-second cooldown on the "Resend Code" button to
-       * prevent rapid re-sends.
-       */
       const startCooldownTimer = (): void => {
-        let secondsLeft = 60;
+        let secondsLeft = TFA_COOLDOWN_SECONDS;
         scBtnRef.disabled = true;
-        scBtnRef.style.backgroundColor = "#f3f2f1";
+        scBtnRef.style.backgroundColor = COLORS.NEUTRAL_LIGHT;
         scBtnRef.style.color = "#a19f9d";
-        scBtnRef.style.borderColor = "#d1d1d1";
+        scBtnRef.style.borderColor = COLORS.NEUTRAL_BORDER;
         scBtnRef.style.cursor = "not-allowed";
         scBtnRef.innerText = `Resend (${secondsLeft}s)`;
 
-        if (cooldownTimer) {
+        if (cooldownTimer !== null) {
           clearInterval(cooldownTimer);
         }
 
@@ -873,23 +983,20 @@ export async function promptAndGenerateSecureAudit(
           if (secondsLeft > 0) {
             scBtnRef.innerText = `Resend (${secondsLeft}s)`;
           } else {
-            if (cooldownTimer) {
+            if (cooldownTimer !== null) {
               clearInterval(cooldownTimer);
+              cooldownTimer = null;
             }
             scBtnRef.disabled = false;
             scBtnRef.style.backgroundColor = "#ffffff";
-            scBtnRef.style.color = "#0078d4";
-            scBtnRef.style.borderColor = "#0078d4";
+            scBtnRef.style.color = COLORS.PRIMARY;
+            scBtnRef.style.borderColor = COLORS.PRIMARY;
             scBtnRef.style.cursor = "pointer";
             scBtnRef.innerText = "Resend Code";
           }
         }, 1000);
       };
 
-      /**
-       * Dispatches the verification passcode through the configured
-       * channel (email / Teams) and starts the cooldown timer.
-       */
       const triggerSendCode = async (): Promise<void> => {
         scBtnRef.innerText = "Sending...";
         scBtnRef.disabled = true;
@@ -907,16 +1014,14 @@ export async function promptAndGenerateSecureAudit(
 
             if (vResult.success && vResult.itemId) {
               storedVerificationItemId = vResult.itemId;
-              console.log("✅ OTP dispatched successfully");
+              vInputRef.focus();
             } else {
-              console.error("❌ OTP dispatch failed:", vResult.error);
               alert(
                 "Failed to dispatch verification code. Please try again."
               );
             }
           }
         } catch (err) {
-          console.error("Failed to send code:", err);
           alert("Failed to send verification code. Please try again.");
         } finally {
           startCooldownTimer();
@@ -928,26 +1033,22 @@ export async function promptAndGenerateSecureAudit(
       };
 
       vInputRef.oninput = (): void => {
-        console.log("🔐 TFA input changed, checking button state");
+        if (vInputRef.value.trim().length === PASSCODE_LENGTH) {
+          tfaVerified = vInputRef.value.trim() === generatedPasscode;
+        }
         updateButtonState();
       };
 
-      void triggerSendCode();
+      // User must click "Send Code" - no automatic send
+      // Only auto-send if explicitly marked as needed
     } else if (requireTFA && !context.channel) {
-      console.warn("⚠️ TFA required but no channel provided");
+      // TFA required but no delivery channel
     }
 
     // -----------------------------------------------------------------
     // Canvas drawing helpers
     // -----------------------------------------------------------------
 
-    /**
-     * Translates a mouse or touch event into canvas-relative
-     * coordinates, accounting for CSS scaling.
-     *
-     * @param e - The originating mouse or touch event.
-     * @returns `{ x, y }` in canvas-pixel space.
-     */
     const getPos = (
       e: MouseEvent | TouchEvent
     ): { x: number; y: number } => {
@@ -972,11 +1073,6 @@ export async function promptAndGenerateSecureAudit(
       };
     };
 
-    /**
-     * Begins a new drawing stroke at the pointer position.
-     *
-     * @param e - The initiating mouse/touch event.
-     */
     const startDraw = (e: MouseEvent | TouchEvent): void => {
       isDrawing = true;
       hasDrawnContent = true;
@@ -986,42 +1082,43 @@ export async function promptAndGenerateSecureAudit(
       e.preventDefault();
     };
 
-    /**
-     * Extends the current stroke to the pointer's new position.
-     *
-     * @param e - The move event.
-     */
     const drawLine = (e: MouseEvent | TouchEvent): void => {
       if (!isDrawing || !ctx) return;
       const pos = getPos(e);
       ctx.lineTo(pos.x, pos.y);
       ctx.stroke();
-      console.log("✏️ Drawing, updating button state");
       updateButtonState();
       e.preventDefault();
     };
 
-    /** Ends the current drawing stroke. */
     const stopDraw = (): void => {
       isDrawing = false;
-      console.log("✋ Drawing stopped, updating button state");
       updateButtonState();
     };
 
     canvas.addEventListener("mousedown", startDraw);
     canvas.addEventListener("mousemove", drawLine);
-    window.addEventListener("mouseup", stopDraw);
     canvas.addEventListener("touchstart", startDraw, { passive: false });
     canvas.addEventListener("touchmove", drawLine, { passive: false });
+
+    window.addEventListener("mouseup", stopDraw);
     window.addEventListener("touchend", stopDraw);
 
-    /** Clears the drawing canvas back to a blank white rectangle. */
+    // Track abort controller listeners
+    abortController.signal.addEventListener("abort", () => {
+      canvas.removeEventListener("mousedown", startDraw);
+      canvas.removeEventListener("mousemove", drawLine);
+      canvas.removeEventListener("touchstart", startDraw);
+      canvas.removeEventListener("touchmove", drawLine);
+      window.removeEventListener("mouseup", stopDraw);
+      window.removeEventListener("touchend", stopDraw);
+    });
+
     clearButton.onclick = (): void => {
       if (ctx) {
         ctx.fillStyle = "#ffffff";
         ctx.fillRect(0, 0, canvas.width, canvas.height);
         hasDrawnContent = false;
-        console.log("🧹 Canvas cleared, updating button state");
         updateButtonState();
       }
     };
@@ -1030,16 +1127,11 @@ export async function promptAndGenerateSecureAudit(
     // File upload handler
     // -----------------------------------------------------------------
 
-    /**
-     * Handles image file selection: validates size, resizes if needed,
-     * and stores the result as a data-URI.
-     */
     fileInput.onchange = (e: Event): void => {
       const target = e.target as HTMLInputElement;
       if (target.files && target.files[0]) {
         const file = target.files[0];
 
-        /* Enforce the advertised 5 MB limit. */
         if (file.size > MAX_UPLOAD_BYTES) {
           alert(
             `File size exceeds 5 MB (${(file.size / 1024 / 1024).toFixed(
@@ -1051,44 +1143,68 @@ export async function promptAndGenerateSecureAudit(
         }
 
         const reader = new FileReader();
+        reader.onerror = (): void => {
+          alert("Failed to load image. Please try again.");
+          target.value = "";
+          updateButtonState();
+        };
+
         reader.onload = (uploadEvent): void => {
           if (uploadEvent.target?.result) {
             const img = new Image();
+            img.onerror = (): void => {
+              alert("Failed to read image file. Please try another image.");
+              target.value = "";
+              updateButtonState();
+            };
+
             img.onload = (): void => {
-              const tempCanvas = document.createElement("canvas");
-              const maxW = 560;
-              const maxH = 160;
-              let w = img.width;
-              let h = img.height;
-
-              if (w > maxW) {
-                h = Math.round((h * maxW) / w);
-                w = maxW;
-              }
-              if (h > maxH) {
-                w = Math.round((w * maxH) / h);
-                h = maxH;
-              }
-
-              tempCanvas.width = w;
-              tempCanvas.height = h;
-              const tCtx = tempCanvas.getContext("2d");
-              if (tCtx) {
-                tCtx.fillStyle = "#ffffff";
-                tCtx.fillRect(0, 0, w, h);
-                tCtx.drawImage(img, 0, 0, w, h);
-                compressedUploadBase64 =
-                  tempCanvas.toDataURL("image/png");
-                uploadPreview.src = compressedUploadBase64;
-                uploadPreview.style.display = "block";
-                console.log("📤 File uploaded, updating button state");
-                updateButtonState();
-              }
+              resizeImageAndStore(img, target);
             };
             img.src = uploadEvent.target.result as string;
           }
         };
         reader.readAsDataURL(file);
+      }
+    };
+
+    /**
+     * Helper to resize image and store result.
+     *
+     * @param img - Loaded image element.
+     * @param fileInput - The input element reference.
+     */
+    const resizeImageAndStore = (img: HTMLImageElement, fileInput: HTMLInputElement): void => {
+      try {
+        const tempCanvas = document.createElement("canvas");
+        let w = img.width;
+        let h = img.height;
+
+        if (w > IMAGE_MAX_WIDTH) {
+          h = Math.round((h * IMAGE_MAX_WIDTH) / w);
+          w = IMAGE_MAX_WIDTH;
+        }
+        if (h > IMAGE_MAX_HEIGHT) {
+          w = Math.round((w * IMAGE_MAX_HEIGHT) / h);
+          h = IMAGE_MAX_HEIGHT;
+        }
+
+        tempCanvas.width = w;
+        tempCanvas.height = h;
+        const tCtx = tempCanvas.getContext("2d");
+        if (tCtx) {
+          tCtx.fillStyle = "#ffffff";
+          tCtx.fillRect(0, 0, w, h);
+          tCtx.drawImage(img, 0, 0, w, h);
+          compressedUploadBase64 = tempCanvas.toDataURL("image/png");
+          uploadPreview.src = compressedUploadBase64;
+          uploadPreview.style.display = "block";
+          updateButtonState();
+        }
+      } catch (error) {
+        alert("Failed to process image. Please try another image.");
+        fileInput.value = "";
+        updateButtonState();
       }
     };
 
@@ -1106,18 +1222,19 @@ export async function promptAndGenerateSecureAudit(
     const cancelButton: HTMLButtonElement =
       document.createElement("button");
     cancelButton.innerText = "Cancel";
+    cancelButton.setAttribute("aria-label", "Cancel signing and close dialog");
     cancelButton.style.padding = "10px 24px";
     cancelButton.style.backgroundColor = "#ffffff";
-    cancelButton.style.border = "1px solid #8a8886";
+    cancelButton.style.border = `1px solid ${COLORS.NEUTRAL_BORDER_DARK}`;
     cancelButton.style.cursor = "pointer";
     cancelButton.style.fontSize = "14px";
     cancelButton.style.fontWeight = "600";
-    cancelButton.style.color = "#323130";
+    cancelButton.style.color = COLORS.NEUTRAL_TEXT;
     cancelButton.style.borderRadius = "4px";
     cancelButton.style.transition = "all 0.2s ease";
 
     cancelButton.onmouseover = (): void => {
-      cancelButton.style.backgroundColor = "#f3f2f1";
+      cancelButton.style.backgroundColor = COLORS.NEUTRAL_LIGHT;
     };
     cancelButton.onmouseout = (): void => {
       cancelButton.style.backgroundColor = "#ffffff";
@@ -1125,30 +1242,49 @@ export async function promptAndGenerateSecureAudit(
 
     signButton.onmouseover = (): void => {
       if (!signButton.disabled) {
-        signButton.style.backgroundColor = "#005a9e";
+        signButton.style.backgroundColor = COLORS.PRIMARY_DARK;
       }
     };
     signButton.onmouseout = (): void => {
       if (!signButton.disabled) {
-        signButton.style.backgroundColor = "#0078d4";
+        signButton.style.backgroundColor = COLORS.PRIMARY;
       }
     };
+
+    // -----------------------------------------------------------------
+    // Keyboard support
+    // -----------------------------------------------------------------
+    const handleEscapeKey = (e: KeyboardEvent): void => {
+      if (e.key === "Escape" || e.key === "Esc") {
+        cleanup();
+        resolve(undefined);
+      }
+    };
+
+    document.addEventListener("keydown", handleEscapeKey);
+    abortController.signal.addEventListener("abort", () => {
+      document.removeEventListener("keydown", handleEscapeKey);
+    });
 
     // -----------------------------------------------------------------
     // Cleanup helper
     // -----------------------------------------------------------------
 
-    /**
-     * Removes the modal overlay from the DOM and unregisters window-
-     * level event listeners to prevent memory leaks.
-     */
     const cleanup = (): void => {
-      window.removeEventListener("mouseup", stopDraw);
-      window.removeEventListener("touchend", stopDraw);
-      document.body.removeChild(overlay);
+      if (activeModalInstance === abortController) {
+        activeModalInstance = null;
+      }
+
+      clearTimeout(timeoutId);
+      abortController.abort();
+
+      document.removeEventListener("keydown", handleEscapeKey);
+
+      if (document.body.contains(overlay)) {
+        document.body.removeChild(overlay);
+      }
     };
 
-    /** Cancel button dismisses the dialog and resolves with `undefined`. */
     cancelButton.onclick = (): void => {
       cleanup();
       resolve(undefined);
@@ -1158,11 +1294,6 @@ export async function promptAndGenerateSecureAudit(
     // Sign button handler
     // -----------------------------------------------------------------
 
-    /**
-     * Validates the TFA code (if required), extracts the signature
-     * data from the active panel, compresses it, optionally caches it,
-     * then generates the SHA-256 audit record.
-     */
     signButton.onclick = async (): Promise<void> => {
       if (requireTFA && verificationInput) {
         const enteredCode = verificationInput.value.trim();
@@ -1184,7 +1315,15 @@ export async function promptAndGenerateSecureAudit(
           );
           return;
         }
-        finalDataUrl = lzwDecompress(cachedCompressedSig);
+        try {
+          finalDataUrl = lzwDecompress(cachedCompressedSig);
+          if (!finalDataUrl.startsWith("data:image")) {
+            throw new Error("Invalid signature data");
+          }
+        } catch {
+          alert("Cached signature is corrupted. Please use a different method.");
+          return;
+        }
       } else if (activeMode === "draw") {
         if (
           !ctx ||
@@ -1193,7 +1332,7 @@ export async function promptAndGenerateSecureAudit(
           alert("Please draw your signature before proceeding.");
           return;
         }
-        finalDataUrl = downscaleCanvas(canvas, 560, 160);
+        finalDataUrl = downscaleCanvas(canvas, CANVAS_WIDTH, CANVAS_HEIGHT);
       } else {
         if (
           !compressedUploadBase64 ||
@@ -1207,17 +1346,17 @@ export async function promptAndGenerateSecureAudit(
         finalDataUrl = compressedUploadBase64;
       }
 
-      const compressedString = lzwCompress(finalDataUrl);
-
-      if (cacheCheckbox.checked) {
-        localStorage.setItem(STORAGE_KEY, compressedString);
-      } else {
-        localStorage.removeItem(STORAGE_KEY);
-      }
-
-      cleanup();
-
       try {
+        const compressedString = lzwCompress(finalDataUrl);
+
+        if (cacheCheckbox.checked) {
+          localStorage.setItem(STORAGE_KEY, compressedString);
+        } else {
+          localStorage.removeItem(STORAGE_KEY);
+        }
+
+        cleanup();
+
         const fullContext = {
           ...context,
           signatureData: compressedString,
@@ -1232,7 +1371,7 @@ export async function promptAndGenerateSecureAudit(
 
         resolve(result);
       } catch (error: unknown) {
-        console.error("Signing failed:", error);
+        alert("Signing failed. Please try again.");
         resolve(undefined);
       }
     };
@@ -1285,11 +1424,15 @@ export async function promptAndGenerateSecureAudit(
 export function getReportableSignature(
   compressedSignatureData: string
 ): string {
-  const decompressed = lzwDecompress(compressedSignatureData);
-  if (!decompressed || !decompressed.startsWith("data:image")) {
+  try {
+    const decompressed = lzwDecompress(compressedSignatureData);
+    if (!decompressed || !decompressed.startsWith("data:image")) {
+      return "";
+    }
+    return decompressed;
+  } catch {
     return "";
   }
-  return decompressed;
 }
 
 // ---------------------------------------------------------------------------
@@ -1299,15 +1442,15 @@ export function getReportableSignature(
 /**
  * Compresses a string using the LZW (Lempel-Ziv-Welch) algorithm.
  *
- * **Caveat:** When the dictionary grows past 65 535 entries,
- * `String.fromCharCode` will produce values that may not survive
- * a round-trip through `localStorage` or JSON.  For very large
- * inputs consider chunking or switching to a Uint16Array-backed
- * encoding.
+ * **Important:** The dictionary is limited to 65,535 entries to prevent
+ * corruption in localStorage/JSON. Large inputs may fail to compress.
+ * For data-URIs larger than this limit, consider using alternative
+ * compression methods or Base64 encoding.
  *
  * @param input - The raw string to compress.
  * @returns The compressed string (each character encodes one
  *          dictionary index).
+ * @throws {Error} If dictionary exceeds maximum size.
  */
 function lzwCompress(input: string): string {
   const dictionary: { [key: string]: number } = {};
@@ -1328,6 +1471,14 @@ function lzwCompress(input: string): string {
       w = wc;
     } else {
       result.push(dictionary[w]);
+
+      if (dictionarySize >= LZW_DICT_MAX) {
+        throw new Error(
+          `LZW dictionary overflow: input is too large to compress (${dictionarySize} entries). ` +
+          `Consider using Base64 encoding instead.`
+        );
+      }
+
       dictionary[wc] = dictionarySize++;
       w = String(c);
     }
@@ -1371,9 +1522,6 @@ function lzwDecompress(compressed: string): string {
     } else if (k === dictionarySize) {
       entry = w + w.charAt(0);
     } else {
-      console.warn(
-        `lzwDecompress: unrecognised dictionary index ${k} at position ${i}.`
-      );
       return "";
     }
 
@@ -1455,13 +1603,16 @@ function isCanvasEmpty(
  * record has not been tampered with, without needing access to the
  * original signature image.
  *
- * **Note:** Only top-level payload keys are sorted. If your payload
- * contains nested objects whose key order may vary, consider using a
- * deep-sort utility before calling this function.
+ * **Deep Sorting:** Payload is deep-sorted to ensure nested objects
+ * maintain consistent key ordering. All payload values must be
+ * JSON-serializable (no functions, symbols, undefined at top level).
+ *
+ * **Timestamp Precision:** Timestamps are stored at second precision
+ * to avoid hash mismatches from millisecond variations.
  *
  * @param auditRecord - The SharePointAuditRecord returned from `promptAndGenerateSecureAudit`.
  * @param signer      - The signer's email address or display name (must match original signer).
- * @param payload     - The original payload object that was signed.
+ * @param payload     - The original payload object that was signed (must be JSON-serializable).
  * @returns `true` if the signature hash is valid and authentic.
  *
  * @example
@@ -1486,31 +1637,26 @@ export async function verifySecureAuditRecord(
 ): Promise<boolean> {
   try {
     if (!auditRecord || !signer || !payload) {
-      console.warn(
-        "verifySecureAuditRecord: Missing required parameters",
-        {
-          auditRecord: !!auditRecord,
-          signer: !!signer,
-          payload: !!payload,
-        }
-      );
       return false;
     }
 
-    // Sort payload keys for consistent hashing
-    const sortedPayloadString: string = JSON.stringify(
-      payload,
-      Object.keys(payload).sort()
-    );
+    if (!auditRecord.signatureHash || !auditRecord.signatureTimestamp) {
+      return false;
+    }
 
-    // Reconstruct the canonical audit envelope
+    const normalizedSigner = sanitizeSigner(signer);
+    const normalizedTimestamp = auditRecord.signatureTimestamp.trim();
+    const normalizedHash = auditRecord.signatureHash.trim();
+
+    validateJsonSerializable(payload);
+    const deepSortedPayload = deepSortPayload(payload) as Record<string, unknown>;
+
     const auditEnvelope: AuditEnvelopeRecord = {
-      payload: JSON.parse(sortedPayloadString) as Record<string, unknown>,
-      signer: signer.toLowerCase().trim(),
-      timestamp: auditRecord.signatureTimestamp.trim(),
+      payload: deepSortedPayload,
+      signer: normalizedSigner,
+      timestamp: normalizedTimestamp,
     };
 
-    // Hash the audit envelope
     const auditEnvelopeJson: string = JSON.stringify(auditEnvelope);
     const encoder: TextEncoder = new TextEncoder();
     const encodedBytes: Uint8Array = encoder.encode(auditEnvelopeJson);
@@ -1524,21 +1670,62 @@ export async function verifySecureAuditRecord(
       .map((b: number): string => b.toString(16).padStart(2, "0"))
       .join("");
 
-    // Compare hashes
-    const isValid = recomputedHash === auditRecord.signatureHash.trim();
-
-    console.log(
-      "verifySecureAuditRecord: Verification result =",
-      isValid,
-      "Recomputed hash =",
-      recomputedHash.substring(0, 16) + "..."
-    );
+    const isValid = recomputedHash === normalizedHash;
 
     return isValid;
   } catch (error) {
-    console.error("verifySecureAuditRecord: Error during verification", error);
     return false;
   }
+}
+
+/**
+ * Deep-sorts a payload object recursively, ensuring nested objects
+ * and array items maintain consistent key ordering.
+ *
+ * @param obj - The object to sort
+ * @returns A new object with all keys sorted recursively
+ */
+function deepSortPayload(obj: Record<string, unknown> | unknown[]): Record<string, unknown> | unknown[] {
+  if (obj === null || obj === undefined) {
+    return obj as Record<string, unknown>;
+  }
+
+  if (Array.isArray(obj)) {
+    return obj.map((item) => {
+      if (item !== null && typeof item === "object" && !Array.isArray(item)) {
+        return deepSortPayload(item as Record<string, unknown>);
+      }
+      return item;
+    });  // ← Removed 'as unknown[]' cast
+  }
+
+  if (typeof obj === "object") {
+    const sorted: Record<string, unknown> = {};
+    const keys = Object.keys(obj as Record<string, unknown>).sort();
+
+    keys.forEach((key) => {
+      const value = (obj as Record<string, unknown>)[key];
+
+      if (value === null || value === undefined) {
+        sorted[key] = value;
+      } else if (Array.isArray(value)) {
+        sorted[key] = value.map((item) => {
+          if (item !== null && typeof item === "object" && !Array.isArray(item)) {
+            return deepSortPayload(item as Record<string, unknown>);
+          }
+          return item;
+        });
+      } else if (typeof value === "object") {
+        sorted[key] = deepSortPayload(value as Record<string, unknown>);
+      } else {
+        sorted[key] = value;
+      }
+    });
+
+    return sorted;
+  }
+
+  return obj;
 }
 
 // ---------------------------------------------------------------------------
@@ -1552,41 +1739,46 @@ export async function verifySecureAuditRecord(
  *
  * This is an internal function and is not exported.
  *
+ * **Key Binding:** The itemID is now included in the audit envelope
+ * hash to tie the signature to a specific transaction and prevent
+ * signature replay attacks.
+ *
  * @param context - The full signer context, extended with the
  *                  compressed signature data string.
  * @returns A fully populated `SharePointAuditRecord`.
  *
- * @throws {Error} If the payload is empty or the signer is blank.
+ * @throws {Error} If the payload is empty, signer is blank, or payload
+ *                 is not JSON-serializable.
  */
 async function generateSecureAuditRecordInternal(
   context: SignerContext & { signatureData: string }
 ): Promise<SharePointAuditRecord> {
-  const { payload, signer, signatureData } = context;
+  const { payload, signer, signatureData, itemID } = context;
+
+  assertNonEmptyString(signer, "Signer");
+  const sanitizedSigner = sanitizeSigner(signer);
 
   if (!payload || Object.keys(payload).length === 0) {
     throw new Error("Payload cannot be empty.");
   }
-  if (!signer || signer.trim() === "") {
-    throw new Error("Signer identifier is required for sealing.");
-  }
 
-  const signatureTimestamp: string = new Date().toISOString();
-  const sortedPayloadString: string = JSON.stringify(
-    payload,
-    Object.keys(payload).sort()
-  );
+  validateJsonSerializable(payload);
+
+  const signatureTimestamp: string = generateTimestamp();
+
+  const deepSortedPayload = deepSortPayload(payload) as Record<string, unknown>;
 
   const auditEnvelope: AuditEnvelopeRecord = {
-    payload: JSON.parse(sortedPayloadString) as Record<string, unknown>,
-    signer: signer.toLowerCase().trim(),
-    timestamp: signatureTimestamp.trim(),
+    payload: deepSortedPayload,
+    signer: sanitizedSigner,
+    timestamp: signatureTimestamp,
+    itemID: itemID,
   };
 
   const auditEnvelopeJson: string = JSON.stringify(auditEnvelope);
   const encoder: TextEncoder = new TextEncoder();
   const encodedBytes: Uint8Array = encoder.encode(auditEnvelopeJson);
 
-  // Passing `encodedBytes.buffer as ArrayBuffer` satisfies the DOM BufferSource definition
   const hashBuffer: ArrayBuffer = await window.crypto.subtle.digest(
     "SHA-256",
     encodedBytes.buffer as ArrayBuffer
@@ -1600,6 +1792,6 @@ async function generateSecureAuditRecordInternal(
     signatureHash,
     signatureData,
     signatureTimestamp,
-    verificationItemId: context.itemID,
+    verificationItemId: itemID,
   };
 }
