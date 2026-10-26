@@ -3,12 +3,7 @@
  *
  * Utility module responsible for idempotent provisioning and configuration
  * of the SharePoint list used for Two-Factor Authentication (2FA) / OTP queueing.
- *
- * This utility ensures:
- *   1. The target SharePoint list exists (creates it if missing).
- *   2. The required custom schema fields ('Passcode' and 'Channel') are provisioned.
- *   3. Item-level security settings are hardened (ReadSecurity=2, WriteSecurity=2)
- *      so non-admin users cannot read or tamper with other users' verification codes.
+ * Designed to be executed during admin installation or setup checks.
  *
  * @module EnsurePendingVerificationsList
  */
@@ -20,48 +15,19 @@ import "@pnp/sp/lists";
 import "@pnp/sp/fields";
 import { WebPartContext } from "@microsoft/sp-webpart-base";
 
-/**
- * Default SharePoint list title used for queuing 2FA verification requests.
- */
 export const DEFAULT_VERIFICATION_LIST_NAME = "PendingVerifications";
-
-/**
- * Default SharePoint list description.
- */
 export const DEFAULT_VERIFICATION_LIST_DESC =
   "Stores temporary verification passcode records for digital signature workflows.";
 
-/**
- * Configuration properties for provisioning the pending verifications list.
- */
 export interface IEnsurePendingVerificationsListProps {
-  /** The SPFx WebPartContext used to initialize the PnPjs client. */
   context: WebPartContext;
-  /** Optional custom title for the SharePoint list (defaults to `"PendingVerifications"`). */
   listTitle?: string;
-  /** Optional custom description for the list. */
   listDescription?: string;
 }
 
 /**
- * Ensures that the SharePoint list for pending verification codes exists,
- * has the required fields (`Passcode` and `Channel`), and enforces item-level
- * read/write security.
- *
- * This function is fully **idempotent**: it can be safely executed multiple times
- * without failing or duplicating columns.
- *
- * @param props - Configuration properties containing context and optional list overrides.
- * @returns A promise that resolves when the list schema and security are verified.
- *
- * @throws {Error} If `context` is invalid or if permissions prevent list provisioning.
- *
- * @example
- * ```ts
- * await ensurePendingVerificationsList({
- *   context: this.context
- * });
- * ```
+ * Idempotently provisions the 2FA verification list, adds required fields,
+ * and enforces security. Intended to be run during admin setup/installation.
  */
 export const ensurePendingVerificationsList = async (
   props: IEnsurePendingVerificationsListProps
@@ -76,26 +42,16 @@ export const ensurePendingVerificationsList = async (
   const sp: SPFI = spfi().using(SPFx(props.context));
   let list: IList = sp.web.lists.getByTitle(listTitle);
 
-  // ---------------------------------------------------------------------------
-  // 1. Ensure the List Exists
-  // ---------------------------------------------------------------------------
+  // 1. Ensure the List Exists (Create if missing)
   try {
     await list();
   } catch {
-    // 100 = Generic List template, true = enable content approval/visibility
+    // 100 = Generic List template
     await sp.web.lists.add(listTitle, listDescription, 100, true);
     list = sp.web.lists.getByTitle(listTitle);
   }
 
-  // ---------------------------------------------------------------------------
-  // 2. Helper: Ensure Field Exists (Idempotent Field Creation)
-  // ---------------------------------------------------------------------------
-  /**
-   * Checks if a field exists by internal name or title; if missing, calls the creation callback.
-   *
-   * @param fieldName     - Internal name or title of the field.
-   * @param createFieldFn - Async callback to execute if the field does not exist.
-   */
+  // 2. Helper: Ensure Field Exists
   const ensureField = async (
     fieldName: string,
     createFieldFn: () => Promise<void>
@@ -103,14 +59,11 @@ export const ensurePendingVerificationsList = async (
     try {
       await list.fields.getByInternalNameOrTitle(fieldName)();
     } catch {
-      // Field does not exist, provision it
       await createFieldFn();
     }
   };
 
-  // ---------------------------------------------------------------------------
   // 3. Ensure 'Passcode' Field
-  // ---------------------------------------------------------------------------
   await ensureField("Passcode", async () => {
     await list.fields.addText("Passcode", {
       Required: true,
@@ -118,9 +71,7 @@ export const ensurePendingVerificationsList = async (
     });
   });
 
-  // ---------------------------------------------------------------------------
   // 4. Ensure 'Channel' Field
-  // ---------------------------------------------------------------------------
   await ensureField("Channel", async () => {
     await list.fields.addChoice("Channel", {
       Choices: ["email", "teams", "both"],
@@ -133,12 +84,7 @@ export const ensurePendingVerificationsList = async (
     await channelField.update({ DefaultValue: "email" });
   });
 
-  // ---------------------------------------------------------------------------
-  // 5. Enforce Item-Level Security Settings
-  // ---------------------------------------------------------------------------
-  // ReadSecurity: 2  -> Users can only read items that were created by themselves.
-  // WriteSecurity: 2 -> Users can only edit/delete items created by themselves.
-  // This prevents end-users from inspecting or hijacking other users' OTP codes.
+  // 5. Enforce Item-Level Security Settings (Admin-configured once)
   await list.update({
     ReadSecurity: 2,
     WriteSecurity: 2,
